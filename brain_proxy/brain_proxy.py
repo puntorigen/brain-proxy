@@ -22,6 +22,12 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_litellm import ChatLiteLLM
 import anyio
 import os
+import re
+from pydantic import BaseModel
+
+# For creating proper Memory objects
+class Memory(BaseModel):
+    content: str
 
 # LangMem primitives (functions, not classes)
 from langmem import create_memory_manager
@@ -229,70 +235,98 @@ class BrainProxy:
             return [d.page_content for d in docs]
 
         async def _store_mem(memories: List[Any]):
-            # Accepts a list of Memory objects or strings, store as documents
+            """Store memories in the vector database."""
             docs = []
             for m in memories:
-                if hasattr(m, 'content'):
-                    # It's a Memory object, extract content as string
-                    docs.append(Document(page_content=str(m.content)))
-                elif isinstance(m, str):
-                    # It's already a string
-                    docs.append(Document(page_content=m))
-                else:
-                    # Try to convert to string as fallback
-                    docs.append(Document(page_content=str(m)))
+                try:
+                    # Convert any memory format to a string and store it
+                    if hasattr(m, 'content'):
+                        content = str(m.content)
+                    elif isinstance(m, dict) and 'content=' in m:
+                        content = str(m['content='])
+                    elif isinstance(m, dict) and 'content' in m:
+                        content = str(m['content'])
+                    elif isinstance(m, str):
+                        content = m
+                    else:
+                        content = str(m)
+                    
+                    docs.append(Document(page_content=content))
+                except Exception as e:
+                    print(f"Error processing memory: {e}")
             
             if docs:
+                print(f"Storing {len(docs)} memories for tenant {tenant}")
                 vec.add_documents(docs)
+                print(f"Successfully stored memories")
 
-        # Use langchain_litellm's ChatLiteLLM for memory manager
+        # Use langchain_litellm's ChatLiteLLM for memory manager directly
+        # No wrapper to avoid potential deadlocks
         manager = create_memory_manager(ChatLiteLLM(model=self.memory_model))
-
+        
         self._mem_managers[tenant] = (manager, _search_mem, _store_mem)
         return self._mem_managers[tenant]
 
     async def _retrieve_memories(self, tenant: str, user_text: str) -> str:
+        """Retrieve relevant memories for the given user text."""
         if not self.enable_memory:
+            print(f"Memory disabled for tenant {tenant}")
             return ""
+            
+        print(f"Retrieving memories for tenant {tenant} with query: '{user_text[:30]}...'")
         manager_tuple = self._get_mem_manager(tenant)
         if not manager_tuple:
+            print(f"No memory manager found for tenant {tenant}")
             return ""
+            
         _, search, _ = manager_tuple
-        memories = await search(user_text, k=self.mem_top_k)
-        return "\n".join(memories)
+        try:
+            print(f"Searching for memories with k={self.mem_top_k}")
+            memories = await search(user_text, k=self.mem_top_k)
+            print(f"Found {len(memories)} memories")
+            
+            if memories:
+                # Log first few characters of each memory for debugging
+                for i, memory in enumerate(memories):
+                    preview = memory[:50] + "..." if len(memory) > 50 else memory
+                    print(f"Memory {i+1}: {preview}")
+                    
+                memory_block = "\n".join(memories)
+                return memory_block
+            else:
+                print("No memories found")
+                return ""
+        except Exception as e:
+            print(f"Error retrieving memories: {e}")
+            return ""
 
     async def _write_memories(
         self, tenant: str, conversation: List[Dict[str, Any]]
     ):
+        """Extract and store memories from the conversation."""
         if not self.enable_memory:
             return
         manager_tuple = self._get_mem_manager(tenant)
         if not manager_tuple:
             return
         manager, _, store = manager_tuple
-        manager_fn = self.manager_fn
-        memories = []
-
-        if manager_fn:
-            memories_or_manager = await _maybe(manager_fn, tenant, conversation)
-            if not memories_or_manager:
-                return
-            if isinstance(memories_or_manager, Callable):
-                manager = memories_or_manager
-            else:
-                memories = memories_or_manager
-        if not memories:  # could be using manager but didn't find any memories
-            memories = await manager(conversation)
-        if not memories:
-            return
-
-        # TODO: prune/filter memories
-
+        
         try:
+            # Get memories from the manager
+            print(f"Extracting memories for tenant {tenant}")
+            memories = await manager(conversation)
+            print(f"Extracted {len(memories) if memories else 0} memories")
+            
+            if not memories:
+                return
+                
+            # Store memories
+            print(f"Storing memories")
             await store(memories)
+            print(f"Memory storage complete")
         except Exception as e:
-            # sometimes mem can be too large
-            print(f"Error storing memories: {e}")
+            print(f"Error in memory processing: {e}")
+            # Continue with the request even if memory fails
 
     # ----------------------------------------------------------------
     # File upload handling for RAG
@@ -409,10 +443,12 @@ class BrainProxy:
             msgs, files = self._split_files(req.messages)
 
             if files:
+                print(f"Ingesting {len(files)} files for tenant {tenant}")
                 await self._ingest_files(files, tenant)
 
             # LangMem retrieve
             if self.enable_memory:
+                print(f"Memory enabled for tenant {tenant}, processing message")
                 user_text = (
                     msgs[-1]["content"]
                     if isinstance(msgs[-1]["content"], str)
@@ -420,8 +456,10 @@ class BrainProxy:
                         p["text"] for p in msgs[-1]["content"] if p["type"] == "text"
                     )
                 )
+                print(f"Extracting user text: '{user_text[:30]}...'")
                 mem_block = await self._retrieve_memories(tenant, user_text)
                 if mem_block:
+                    print(f"Adding memory block to conversation: {len(mem_block)} chars")
                     msgs = msgs[:-1] + [
                         {
                             "role": "system",
@@ -429,6 +467,10 @@ class BrainProxy:
                         },
                         msgs[-1],
                     ]
+                else:
+                    print("No memory block to add")
+            else:
+                print("Memory disabled for tenant {tenant}")
 
             msgs = await self._rag(msgs, tenant)
 
