@@ -15,7 +15,11 @@ from fastapi import FastAPI
 from brain_proxy import BrainProxy
 import dotenv, os
 
+# Load environment variables from .env file
 dotenv.load_dotenv()
+
+# Enable debug mode for testing
+DEBUG_MODE = True
 
 app = FastAPI()
 
@@ -28,6 +32,8 @@ brain_proxy = BrainProxy(
     # Optional: customize memory settings
     enable_memory=True,
     mem_top_k=6,
+    # Debug mode - will print detailed logs when set to True
+    debug=DEBUG_MODE,
 )
 
 app.include_router(brain_proxy.router, prefix="/v1")    
@@ -38,6 +44,7 @@ def root():
     return {
         "message": "Hello from FastAPI with brain-proxy!",
         "proxy_status": "Ready",
+        "debug_mode": "enabled" if DEBUG_MODE else "disabled",
         "models": {
             "default": brain_proxy.default_model,
             "memory": brain_proxy.memory_model,

@@ -482,13 +482,18 @@ class BrainProxy:
         if not files:
             return
         docs = []
+        
+        # Create tenant directory if it doesn't exist
+        tenant_dir = Path(f"{self.storage_dir}/{tenant}/files")
+        tenant_dir.mkdir(exist_ok=True, parents=True)
+        
         for file in files:
             self._log(f"Ingesting file: {file.name} ({file.mime})")
             try:
                 name = file.name.replace(" ", "_")
                 data = base64.b64decode(file.data)
-                path = Path(f"{self.storage_dir}/{tenant}_{_sha(data)[:8]}_{name}")
-                path.parent.mkdir(exist_ok=True, parents=True)
+                # Store file in tenant-specific folder
+                path = tenant_dir / f"{_sha(data)[:8]}_{name}"
                 path.write_bytes(data)
                 text = self.extract_text(path, file.mime)
                 if text.strip():
