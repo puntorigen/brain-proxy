@@ -2,6 +2,12 @@
 A minimal FastAPI example using brain-proxy.
 Run with:
     uvicorn examples.fastapi_example:app --reload
+
+Required environment variables:
+    - OPENAI_API_KEY (for OpenAI models)
+    - AZURE_API_KEY (for Azure models)
+    - ANTHROPIC_API_KEY (for Anthropic models)
+    etc... (see litellm docs for all supported providers)
 """
 
 from fastapi import FastAPI
@@ -13,9 +19,15 @@ dotenv.load_dotenv()
 
 app = FastAPI()
 
-# Example: instantiate your BrainProxy class (adjust if needed)
+# Example: instantiate your BrainProxy class
 brain_proxy = BrainProxy(
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
+    # Models in litellm format: "{provider}/{model_name}"
+    default_model="openai/o4-mini-2025-04-16",
+    memory_model="openai/o4-mini-2025-04-16",
+    embedding_model="openai/text-embedding-3-small",
+    # Optional: customize memory settings
+    enable_memory=True,
+    mem_top_k=6,
 )
 
 app.include_router(brain_proxy.router, prefix="/v1")    
@@ -23,4 +35,12 @@ app.include_router(brain_proxy.router, prefix="/v1")
 @app.get("/")
 def root():
     # Example usage of brain_proxy; replace with real method as needed
-    return {"message": "Hello from FastAPI with brain-proxy!", "proxy_status": str(brain_proxy)}
+    return {
+        "message": "Hello from FastAPI with brain-proxy!",
+        "proxy_status": "Ready",
+        "models": {
+            "default": brain_proxy.default_model,
+            "memory": brain_proxy.memory_model,
+            "embedding": brain_proxy.embedding_model
+        }
+    }
