@@ -5,7 +5,7 @@ pip install fastapi openai langchain-chroma langmem tiktoken
 """
 
 from __future__ import annotations
-import asyncio, base64, hashlib, json, time
+import asyncio, base64, hashlib, json, time, re
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
@@ -314,18 +314,125 @@ class BrainProxy:
         try:
             # Get memories from the manager
             print(f"Extracting memories for tenant {tenant}")
-            memories = await manager(conversation)
-            print(f"Extracted {len(memories) if memories else 0} memories")
+            raw_memories = await manager(conversation)
             
-            if not memories:
-                return
+            # Debug logging to understand the format
+            print(f"Raw memory count: {len(raw_memories) if raw_memories else 0}")
+            if raw_memories:
+                for i, mem in enumerate(raw_memories):
+                    print(f"Raw memory {i+1} type: {type(mem)}")
+                    if hasattr(mem, 'id') and hasattr(mem, 'content'):
+                        print(f"  String representation: {str(mem)[:50]}")
+            
+            # Convert ExtractedMemory objects to proper format
+            if raw_memories:
+                # Create a list to hold properly formatted memories
+                proper_memories = []
                 
-            # Store memories
-            print(f"Storing memories")
-            await store(memories)
-            print(f"Memory storage complete")
+                for mem in raw_memories:
+                    try:
+                        # Extract the content properly based on the object type
+                        
+                        # Case 1: ExtractedMemory named tuple (id, content)
+                        if hasattr(mem, 'id') and hasattr(mem, 'content'):
+                            if hasattr(mem.content, 'content'):
+                                # Extract content from the BaseModel
+                                content = mem.content.content
+                                formatted_mem = {"content": content}
+                                proper_memories.append(formatted_mem)
+                            elif hasattr(mem.content, 'model_dump'):
+                                # Extract content using model_dump method
+                                model_data = mem.content.model_dump()
+                                if 'content' in model_data:
+                                    formatted_mem = {"content": model_data['content']}
+                                    proper_memories.append(formatted_mem)
+                                else:
+                                    # If no content field, use the whole model data as string
+                                    formatted_mem = {"content": str(model_data)}
+                                    proper_memories.append(formatted_mem)
+                            elif isinstance(mem.content, dict) and 'content' in mem.content:
+                                # Content is a dict with content field
+                                formatted_mem = {"content": mem.content['content']}
+                                proper_memories.append(formatted_mem)
+                            else:
+                                # Fallback for other types
+                                formatted_mem = {"content": str(mem.content)}
+                                proper_memories.append(formatted_mem)
+                                
+                        # Case 2: Dictionary with 'content' key
+                        elif isinstance(mem, dict) and 'content' in mem:
+                            formatted_mem = {"content": str(mem['content'])}
+                            proper_memories.append(formatted_mem)
+                            
+                        # Case 3: Malformed dictionaries with format {'content=': val, 'text': val}
+                        elif isinstance(mem, dict) and 'content=' in mem:
+                            # Find text fields (longer string keys)
+                            text_keys = [k for k in mem.keys() 
+                                       if k != 'content=' and isinstance(k, str) and len(k) > 10]
+                            
+                            if text_keys:
+                                # Use the text key with actual content
+                                longest_key = max(text_keys, key=len)
+                                formatted_mem = {"content": longest_key}
+                                proper_memories.append(formatted_mem)
+                                print(f"  Fixed complex memory format: {longest_key[:30]}...")
+                            else:
+                                # Fallback: concatenate all string values
+                                content_parts = []
+                                for k, v in mem.items():
+                                    if isinstance(v, str) and len(v) > 2:
+                                        content_parts.append(v)
+                                    elif isinstance(k, str) and len(k) > 10 and k != 'content=':
+                                        content_parts.append(k)
+                                        
+                                if content_parts:
+                                    content = " ".join(content_parts)
+                                    formatted_mem = {"content": content}
+                                    proper_memories.append(formatted_mem)
+                                else:
+                                    # Last resort: use content= value
+                                    formatted_mem = {"content": str(mem['content='])}
+                                    proper_memories.append(formatted_mem)
+                            
+                        # Case 4: String value
+                        elif isinstance(mem, str):
+                            formatted_mem = {"content": mem}
+                            proper_memories.append(formatted_mem)
+                            
+                        # Case 5: Any other object with __dict__ attribute
+                        elif hasattr(mem, '__dict__'):
+                            mem_dict = mem.__dict__
+                            if 'content' in mem_dict:
+                                formatted_mem = {"content": str(mem_dict['content'])}
+                                proper_memories.append(formatted_mem)
+                            else:
+                                # Use the entire object representation
+                                formatted_mem = {"content": str(mem)}
+                                proper_memories.append(formatted_mem)
+                        
+                        # If nothing worked, skip this memory
+                        else:
+                            print(f"  Could not extract content from memory: {type(mem)}")
+                            
+                    except Exception as e:
+                        print(f"  Error formatting memory: {e}")
+                        continue
+                
+                print(f"Formatted {len(proper_memories)} memories properly")
+                
+                if proper_memories:
+                    # Store the properly formatted memories
+                    print(f"Storing {len(proper_memories)} memories for tenant {tenant}")
+                    await store(proper_memories)
+                    print(f"Successfully stored memories")
+                    print(f"Memory storage complete")
+            else:
+                print("No memories to store")
+                
         except Exception as e:
             print(f"Error in memory processing: {e}")
+            import traceback
+            traceback.print_exc()
             # Continue with the request even if memory fails
 
     # ----------------------------------------------------------------
