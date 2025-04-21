@@ -16,6 +16,7 @@
 - ✅ Streaming via Server-Sent Events
 - ✅ Custom text extractor support for PDFs, CSVs, etc.
 - ✅ No frontend changes required
+- ✅ **Now uses LiteLLM by default — specify any model using `provider/model` (e.g., `openai/gpt-4o`, `cerebras/llama3-70b-instruct`)**
 
 ---
 
@@ -61,7 +62,7 @@ This means you can serve multiple brands or users safely and scalably from a sin
 
 ---
 
-## 💬 OpenAI SDK Example
+## 💬 LiteLLM/"OpenAI" SDK Example
 
 ```python
 import openai
@@ -70,7 +71,7 @@ openai.api_key = "sk-fake"
 openai.base_url = "http://localhost:8000/v1/acme"
 
 response = openai.ChatCompletion.create(
-    model="gpt-4o",
+    model="openai/gpt-4o",  # Now specify provider/model!
     messages=[{"role": "user", "content": "What's 3 + 2?"}]
 )
 
@@ -81,7 +82,7 @@ print(response["choices"][0]["message"]["content"])
 
 ```python
 stream = openai.ChatCompletion.create(
-    model="gpt-4o",
+    model="openai/gpt-4o",  # Or e.g. "cerebras/llama3-70b-instruct"
     stream=True,
     messages=[{"role": "user", "content": "Tell me a short story about an AI fox."}]
 )
@@ -89,6 +90,19 @@ stream = openai.ChatCompletion.create(
 for chunk in stream:
     print(chunk.choices[0].delta.get("content", ""), end="")
 ```
+
+---
+
+## ⚡️ Model selection
+
+By default, brain-proxy now uses [LiteLLM](https://github.com/BerriAI/litellm) under the hood. This means you can specify any supported model using the `provider/model` format:
+
+- `openai/gpt-4o`
+- `cerebras/llama3-70b-instruct`
+- `anthropic/claude-3-opus-20240229`
+- ...and many more!
+
+Just set the `model` parameter in your requests accordingly.
 
 ---
 
@@ -138,7 +152,7 @@ proxy = BrainProxy(
 
 - [x] Multi-agent manager hook
 - [x] Usage hooks + token metering
-- [ ] Use LiteLLM instead to support more models
+- [x] Use LiteLLM instead to support more models
 - [ ] MCP support
 - [ ] LangGraph integration
 

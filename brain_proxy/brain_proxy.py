@@ -96,8 +96,8 @@ class BrainProxy:
         usage_hook: Callable[[str, int, float], Any] | None = None,
         max_upload_mb: int = 20,
     ):
-        self.llm = AsyncOpenAI(api_key=openai_api_key, base_url=upstream_base)
-        self.base_url = upstream_base
+        #self.llm = AsyncOpenAI(api_key=openai_api_key, base_url=upstream_base)
+        #self.base_url = upstream_base
         self.embeddings = OpenAIEmbeddings(api_key=openai_api_key)
         self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings)
         self.enable_memory = enable_memory
@@ -253,13 +253,13 @@ class BrainProxy:
         if stream:
             return await acompletion(
                 model=model, messages=msgs, stream=stream,
-                base_url=self.base_url
+                #base_url=self.base_url
             )
         else:
             # For non-streaming responses, we need to await the response directly
             return await acompletion(
                 model=model, messages=msgs, stream=False,
-                base_url=self.base_url
+                #base_url=self.base_url
             )
 
 
