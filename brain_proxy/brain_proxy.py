@@ -12,15 +12,15 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from langchain_openai import OpenAIEmbeddings
-from litellm import acompletion
+from litellm import acompletion, embedding
 from langchain_chroma import Chroma
+from langchain.embeddings.base import Embeddings
+from langchain.embeddings import CacheBackedEmbeddings
 from langchain.storage import LocalFileStore
 from langchain.schema import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_litellm import ChatLiteLLM
 import anyio
-from asgiref.sync import async_to_sync
 import os
 
 # LangMem primitives (functions, not classes)
@@ -79,6 +79,87 @@ def default_vector_store_factory(tenant, embeddings):
 
 
 # -------------------------------------------------------------------
+# Utility classes
+# -------------------------------------------------------------------
+class LiteLLMEmbeddings(Embeddings):
+    """Embeddings provider that uses litellm's synchronous embedding function.
+    This enables support for any provider supported by litellm.
+    """
+    
+    def __init__(self, model: str):
+        """Initialize with model in litellm format (e.g., 'openai/text-embedding-3-small')"""
+        self.model = model
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Get embeddings for multiple documents"""
+        results = []
+        # Process each text individually to handle potential rate limits
+        for text in texts:
+            response = embedding(
+                model=self.model,
+                input=text
+            )
+            # Handle the response format properly
+            if hasattr(response, 'data') and response.data:
+                # OpenAI-like format with data.embedding
+                if hasattr(response.data[0], 'embedding'):
+                    results.append(response.data[0].embedding)
+                # Dict format with data[0]['embedding']
+                elif isinstance(response.data[0], dict) and 'embedding' in response.data[0]:
+                    results.append(response.data[0]['embedding'])
+            # Direct embedding array format
+            elif isinstance(response, list) and len(response) > 0:
+                results.append(response[0])
+            # Fallback
+            else:
+                print(f"Warning: Unexpected embedding response format: {type(response)}")
+                if isinstance(response, dict) and 'embedding' in response:
+                    results.append(response['embedding'])
+                elif isinstance(response, dict) and 'data' in response:
+                    data = response['data']
+                    if isinstance(data, list) and len(data) > 0:
+                        if isinstance(data[0], dict) and 'embedding' in data[0]:
+                            results.append(data[0]['embedding'])
+        
+        return results
+    
+    def embed_query(self, text: str) -> List[float]:
+        """Get embeddings for a single query"""
+        response = embedding(
+            model=self.model,
+            input=text
+        )
+        
+        # Handle the response format properly
+        if hasattr(response, 'data') and response.data:
+            # OpenAI-like format with data.embedding
+            if hasattr(response.data[0], 'embedding'):
+                return response.data[0].embedding
+            # Dict format with data[0]['embedding']
+            elif isinstance(response.data[0], dict) and 'embedding' in response.data[0]:
+                return response.data[0]['embedding']
+        # Direct embedding array format
+        elif isinstance(response, list) and len(response) > 0:
+            return response[0]
+        # Dictionary format
+        elif isinstance(response, dict):
+            if 'data' in response:
+                data = response['data']
+                if isinstance(data, list) and len(data) > 0:
+                    if isinstance(data[0], dict) and 'embedding' in data[0]:
+                        return data[0]['embedding']
+            elif 'embedding' in response:
+                return response['embedding']
+        
+        # If we get here, print the response type for debugging
+        print(f"Warning: Unexpected embedding response format: {type(response)}")
+        print(f"Response content: {response}")
+        
+        # Return empty list as fallback (should not happen)
+        return []
+
+
+# -------------------------------------------------------------------
 # BrainProxy
 # -------------------------------------------------------------------
 class BrainProxy:
@@ -120,13 +201,13 @@ class BrainProxy:
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self._mem_managers: Dict[str, Any] = {}
 
-        # Extract OpenAI API key from environment
-        openai_api_key = os.environ.get("OPENAI_API_KEY", "")
-        
-        # Initialize embeddings using OpenAI for now (reliable in FastAPI)
-        self.embeddings = OpenAIEmbeddings(
-            openai_api_key=openai_api_key,
-            model=self.embedding_model.replace("openai/", "")
+        # Initialize embeddings using litellm's synchronous embedding function
+        underlying_embeddings = LiteLLMEmbeddings(model=self.embedding_model)
+        fs = LocalFileStore(f"{self.storage_dir}/embeddings_cache")
+        self.embeddings = CacheBackedEmbeddings.from_bytes_store(
+            underlying_embeddings=underlying_embeddings,
+            document_embedding_cache=fs,
+            namespace=self.embedding_model
         )
         
         self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings)
