@@ -22,8 +22,8 @@ app = FastAPI()
 # Example: instantiate your BrainProxy class
 brain_proxy = BrainProxy(
     # Models in litellm format: "{provider}/{model_name}"
-    default_model="openai/o4-mini-2025-04-16",
-    memory_model="openai/o4-mini-2025-04-16",
+    default_model="openai/gpt-4o-mini",
+    memory_model="openai/gpt-4o-mini",
     embedding_model="openai/text-embedding-3-small",
     # Optional: customize memory settings
     enable_memory=True,

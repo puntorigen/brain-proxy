@@ -171,12 +171,12 @@ class BrainProxy:
         vector_store_factory: Callable[[str, Any], Chroma] = default_vector_store_factory,
         # memory settings
         enable_memory: bool = True,
-        memory_model: str = "openai/o4-mini-2025-04-16",  # litellm format e.g. "azure/gpt-35-turbo"
+        memory_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-35-turbo"
         embedding_model: str = "openai/text-embedding-3-small",  # litellm format e.g. "azure/ada-002"
         mem_top_k: int = 6,
         mem_working_max: int = 12,
         # misc
-        default_model: str = "openai/gpt-4o",  # litellm format e.g. "azure/gpt-4"
+        default_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-4"
         storage_dir: str | Path = "tenants",
         extract_text: Callable[[Path, str], str] | None = None,
         manager_fn: Callable[..., Any] | None = None,  # multi‑agent hook
