@@ -13,6 +13,7 @@
 - ✅ File ingestion via `file_data` messages
 - ✅ RAG with Chroma + LangChain
 - ✅ LangMem-powered long & short-term memory
+- ✅ Tenant-specific file storage for improved organization and isolation
 - ✅ Streaming via Server-Sent Events
 - ✅ Custom text extractor support for PDFs, CSVs, etc.
 - ✅ No frontend changes required
@@ -35,7 +36,12 @@ from fastapi import FastAPI
 from brain_proxy import BrainProxy
 
 proxy = BrainProxy(
-    openai_api_key="sk-...",  # used for both LLM + embeddings
+    default_model="openai/gpt-4o-mini",  # Default model in litellm format
+    memory_model="openai/gpt-4o-mini",  # Memory model in litellm format
+    embedding_model="openai/text-embedding-3-small",  # Embedding model in litellm format
+    enable_memory=True,  # Enable/disable memory features (default True)
+    debug=False,  # Enable detailed debug logging when needed
+    storage_dir="tenants",  # Default base directory for tenant data
 )
 
 app = FastAPI()
@@ -50,6 +56,289 @@ http://localhost:8000/v1/<tenant>/chat/completions
 
 ---
 
+## 🛠️ Configuration Options
+
+The `BrainProxy` class accepts the following parameters:
+
+```python
+BrainProxy(
+    # Core model settings
+    default_model="openai/gpt-4o-mini",  # Primary completion model (litellm format)
+    
+    # Memory settings
+    enable_memory=True,  # Enable/disable memory system
+    memory_model="openai/gpt-4o-mini",  # Model for memory management (litellm format)
+    embedding_model="openai/text-embedding-3-small",  # Model for embeddings (litellm format)
+    mem_top_k=6,  # Maximum number of memories to retrieve per query
+    mem_working_max=12,  # Maximum memories to keep in working memory
+    
+    # Storage settings
+    storage_dir="tenants",  # Base directory for tenant data
+    
+    # Customization
+    extract_text=None,  # Custom text extraction function for files
+    
+    # Hooks
+    manager_fn=None,  # Multi-agent manager hook
+    auth_hook=None,  # Authentication hook
+    usage_hook=None,  # Usage tracking hook
+    
+    # File handling
+    max_upload_mb=20,  # Maximum file upload size in MB
+    
+    # Debugging
+    debug=False,  # Enable detailed debug logging
+)
+```
+
+### ⚠️ Important: API Keys and Default Models
+
+#### Default Models
+
+BrainProxy uses these default models if not explicitly specified:
+- `default_model`: "openai/gpt-4o-mini" - Used for chat completions
+- `memory_model`: "openai/gpt-4o-mini" - Used for memory extraction and management
+- `embedding_model`: "openai/text-embedding-3-small" - Used for vector embeddings
+
+These are all optional parameters - if you don't specify them, the default values will be used.
+
+#### API Key Requirements
+
+Since brain-proxy uses [LiteLLM](https://github.com/BerriAI/litellm) under the hood, you need to set the appropriate API keys as environment variables for your chosen providers:
+
+```bash
+# OpenAI models (for openai/gpt-4o, openai/text-embedding-3-small, etc.)
+export OPENAI_API_KEY=sk-...
+
+# Anthropic models (for anthropic/claude-3-opus, etc.)
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Azure OpenAI models (for azure/gpt-4, etc.)
+export AZURE_API_KEY=...
+export AZURE_API_BASE=...
+export AZURE_API_VERSION=...
+
+# Google models (for google/gemini-pro, etc.)
+export GOOGLE_API_KEY=...
+```
+
+You only need to set the API keys for the providers you're actually using. For example, if you're only using OpenAI models, you only need to set `OPENAI_API_KEY`.
+
+See the [LiteLLM documentation](https://docs.litellm.ai/docs/providers) for a full list of supported providers and their required environment variables.
+
+### 🧠 Memory Settings Explained
+
+#### `memory_model` - Your Agent's Memory Engine
+
+The `memory_model` parameter specifies which LLM powers your agent's memory capabilities. This model is responsible for:
+
+- Extracting important facts from conversations
+- Creating structured memory entries
+- Consolidating related memories to avoid duplication
+
+```python
+# Using GPT-4o for more advanced memory extraction
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    memory_model="openai/gpt-4o",  # More advanced model for memories
+)
+
+# Budget-friendly memory setup
+proxy = BrainProxy(
+    default_model="openai/gpt-4o", 
+    memory_model="openai/gpt-3.5-turbo",  # Economical memory model
+)
+
+# Using Anthropic's Claude for memory management
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    memory_model="anthropic/claude-3-haiku-20240307",
+)
+```
+
+A more capable memory model results in:
+- More nuanced memory extraction
+- Better recognition of implicit preferences
+- Higher quality context preservation
+
+#### `embedding_model` - The Retrieval Brain
+
+This model converts text into vector embeddings for similarity search. It powers:
+- Document and memory retrieval
+- Similar question matching
+- Semantic search across all tenant data
+
+```python
+# Using OpenAI's latest embeddings model
+proxy = BrainProxy(
+    embedding_model="openai/text-embedding-3-large",  # Higher dimension embeddings
+)
+
+# Using cost-effective models
+proxy = BrainProxy(
+    embedding_model="openai/text-embedding-3-small",  # More economical
+)
+
+# Azure deployment example
+proxy = BrainProxy(
+    embedding_model="azure/text-embedding-ada-002", 
+)
+```
+
+### 📄 Custom Text Extraction
+
+The `extract_text` parameter lets you plug in specialized text extraction functions for different file types.
+
+#### PDF Extraction Example
+
+```python
+from pdfminer.high_level import extract_text
+
+def extract_document_text(path, mime_type):
+    """Extract text from various document formats"""
+    if mime_type == "application/pdf":
+        return extract_text(path)
+    elif mime_type == "text/plain":
+        return path.read_text(encoding="utf-8")
+    elif mime_type == "text/csv":
+        import pandas as pd
+        df = pd.read_csv(path)
+        return df.to_string()
+    else:
+        return f"Unsupported format: {mime_type}"
+
+# Use the custom extractor
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    extract_text=extract_document_text
+)
+```
+
+#### Advanced Image + Document Extraction
+
+```python
+async def multimodal_extractor(path, mime_type):
+    """Extract text from documents and images using specialized models"""
+    if mime_type.startswith("image/"):
+        # Use Moondream (open-source lightweight vision model) for images
+        try:
+            import moondream as md
+            from PIL import Image
+            
+            # Load the image
+            img = Image.open(path)
+            
+            # Initialize Moondream model
+            # You can use either the 2B parameter model or the smaller 0.5B model
+            model = md.vl(model="path/to/moondream-2b-int8.mf")
+            
+            # Encode the image (this is a crucial step for Moondream)
+            encoded_image = model.encode_image(img)
+            
+            # Generate a descriptive caption
+            caption = model.caption(encoded_image)["caption"]
+            
+            # You can also ask specific questions about the image
+            # details = model.query(encoded_image, "Describe this image in detail.")["answer"]
+            
+            return f"Image description: {caption}"
+        except Exception as e:
+            return f"Error processing image: {str(e)}"
+    
+    elif mime_type == "application/pdf":
+        # Extract text from PDFs
+        from pdfminer.high_level import extract_text
+        return extract_text(path)
+    
+    # Handle other formats...
+
+This example uses [Moondream](https://github.com/vikhyat/moondream), an efficient multimodal vision model that can be run entirely locally, even on CPU-only machines. Install it with `pip install moondream`.
+
+### 🪝 Powerful Hook Functions
+
+brain-proxy provides three powerful hooks that help you customize, secure, and monitor your proxy:
+
+#### `auth_hook` - Custom Authentication
+
+Secure your endpoints with tenant-specific authentication:
+
+```python
+async def custom_auth(request, tenant):
+    """Validate tenant-specific access"""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    
+    # Check tenant-specific permissions
+    if not is_authorized(token, tenant):
+        raise HTTPException(status_code=403, detail="Not authorized for this tenant")
+    
+    # You can also map tokens to specific users
+    request.state.user_id = get_user_id(token)
+
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    auth_hook=custom_auth
+)
+```
+
+#### `usage_hook` - Track LLM Consumption
+
+Monitor token usage and costs by tenant:
+
+```python
+async def track_usage(tenant, tokens, duration):
+    """Record usage metrics per tenant"""
+    print(f"Tenant {tenant} used {tokens} tokens in {duration:.2f}s")
+    
+    # Log to database
+    await db.usage_logs.insert_one({
+        "tenant": tenant,
+        "tokens": tokens,
+        "duration": duration,
+        "timestamp": datetime.now(),
+        "cost": calculate_cost(tokens)
+    })
+    
+    # Update quota limits
+    await update_tenant_quota(tenant, tokens)
+
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    usage_hook=track_usage
+)
+```
+
+#### `manager_fn` - Multi-Agent Orchestration
+
+This hook allows you to add multi-agent workflows for coordinating different AI models or systems:
+
+```python
+async def manager_fn(request, tenant, conversation):
+    """Custom processing logic for each tenant/request"""
+    # You can inspect the request and tenant to determine special handling
+    
+    # Perform custom agent routing or orchestration
+    if "financial" in request.body:
+        # Route to specialized financial analysis
+        return await financial_agent.process(conversation)
+    
+    # You can return processed messages or modify the conversation flow
+    # The output of this function is used in the processing pipeline
+    
+    # Return None for default behavior
+    return None
+
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    manager_fn=manager_fn
+)
+```
+
+The `manager_fn` hook is primarily designed for integrating with more complex agent frameworks or enabling custom message preprocessing before the chat completion is generated.
+
+With these hooks, you can build sophisticated multi-tenant applications with fine-grained security, usage monitoring, and dynamic agent delegation.
+
+---
+
 ## 🧠 Multi-tenancy explained
 
 Every tenant (`/v1/acme`, `/v1/alpha`, etc):
@@ -57,6 +346,7 @@ Every tenant (`/v1/acme`, `/v1/alpha`, etc):
 - Gets its own vector store (for RAG)
 - Has isolated LangMem memory (short- and long-term)
 - Can upload files (auto-indexed + persisted)
+- Has a dedicated file storage directory structure
 
 This means you can serve multiple brands or users safely and scalably from a single backend.
 
@@ -124,7 +414,7 @@ Send `file_data` parts inside messages to upload PDFs, CSVs, images, etc:
 }
 ```
 
-Files are saved, parsed, embedded, and used in RAG on the fly.
+Files are saved in tenant-specific directories, parsed, embedded, and used in RAG on the fly.
 
 ---
 
@@ -141,8 +431,21 @@ def parse_pdf(path: Path, mime: str) -> str:
 
 ```python
 proxy = BrainProxy(
-    openai_api_key="sk-...",
+    default_model="openai/gpt-4o-mini",
     extract_text=parse_pdf
+)
+```
+
+---
+
+## 🐞 Debugging
+
+Enable debug mode to see detailed information about memory processing, file ingestion, and other operations:
+
+```python
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    debug=True  # Shows detailed logs for troubleshooting
 )
 ```
 
@@ -153,6 +456,8 @@ proxy = BrainProxy(
 - [x] Multi-agent manager hook
 - [x] Usage hooks + token metering
 - [x] Use LiteLLM instead to support more models
+- [x] Tenant-specific file storage
+- [x] Debug mode for troubleshooting
 - [ ] MCP support
 - [ ] LangGraph integration
 
@@ -169,4 +474,4 @@ Made for backend devs who want to move fast ⚡
 
 Issues and PRs welcome!
 
-Let’s build smarter backends — together.
+Let's build smarter backends — together.
