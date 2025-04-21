@@ -19,6 +19,7 @@ setup(
         "tiktoken",
         "pydantic",
         "langchain-openai",
+        "numpy<2.0.0",
     ],
     include_package_data=True,
 )
