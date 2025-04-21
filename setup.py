@@ -20,6 +20,7 @@ setup(
         "pydantic",
         "langchain-openai",
         "numpy<2.0.0",
+        "litellm",
     ],
     include_package_data=True,
 )

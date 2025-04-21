@@ -19,7 +19,8 @@ dependencies = [
     "tiktoken",
     "pydantic",
     "langchain-openai",
-    "numpy<2.0.0"
+    "numpy<2.0.0",
+    "litellm"
 ]
 
 [project.urls]

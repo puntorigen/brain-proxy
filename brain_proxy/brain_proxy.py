@@ -13,6 +13,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
+#from langchain_litellm import ChatLiteLLM
+from litellm import acompletion
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 from langchain.schema import Document
@@ -95,6 +97,7 @@ class BrainProxy:
         max_upload_mb: int = 20,
     ):
         self.llm = AsyncOpenAI(api_key=openai_api_key, base_url=upstream_base)
+        self.base_url = upstream_base
         self.embeddings = OpenAIEmbeddings(api_key=openai_api_key)
         self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings)
         self.enable_memory = enable_memory
@@ -233,7 +236,7 @@ class BrainProxy:
     # ----------------------------------------------------------------
     # Upstream dispatch
     # ----------------------------------------------------------------
-    async def _dispatch(self, msgs, model: str, *, stream: bool):
+    async def _dispatch_bak(self, msgs, model: str, *, stream: bool):
         """Dispatch to OpenAI API"""
         if stream:
             return await self.llm.chat.completions.create(
@@ -244,6 +247,21 @@ class BrainProxy:
             return await self.llm.chat.completions.create(
                 model=model, messages=msgs, stream=False
             )
+
+    async def _dispatch(self, msgs, model: str, *, stream: bool):
+        """Dispatch to OpenAI API"""
+        if stream:
+            return await acompletion(
+                model=model, messages=msgs, stream=stream,
+                base_url=self.base_url
+            )
+        else:
+            # For non-streaming responses, we need to await the response directly
+            return await acompletion(
+                model=model, messages=msgs, stream=False,
+                base_url=self.base_url
+            )
+
 
     # ----------------------------------------------------------------
     # FastAPI route
