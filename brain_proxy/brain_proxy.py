@@ -189,6 +189,7 @@ class BrainProxy:
         auth_hook: Callable[[Request, str], Any] | None = None,
         usage_hook: Callable[[str, int, float], Any] | None = None,
         max_upload_mb: int = 20,
+        debug: bool = False,
     ):
         # Initialize basic attributes first
         self.storage_dir = Path(storage_dir)
@@ -206,6 +207,7 @@ class BrainProxy:
         self.usage_hook = usage_hook
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self._mem_managers: Dict[str, Any] = {}
+        self.debug = debug
 
         # Initialize embeddings using litellm's synchronous embedding function
         underlying_embeddings = LiteLLMEmbeddings(model=self.embedding_model)
@@ -219,6 +221,11 @@ class BrainProxy:
         self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings)
         self.router = APIRouter()
         self._mount()
+
+    def _log(self, message: str) -> None:
+        """Log debug messages only when debug is enabled."""
+        if self.debug:
+            print(message)
 
     # ----------------------------------------------------------------
     # Memory helpers
@@ -253,12 +260,12 @@ class BrainProxy:
                     
                     docs.append(Document(page_content=content))
                 except Exception as e:
-                    print(f"Error processing memory: {e}")
+                    self._log(f"Error processing memory: {e}")
             
             if docs:
-                print(f"Storing {len(docs)} memories for tenant {tenant}")
+                self._log(f"Storing {len(docs)} memories for tenant {tenant}")
                 vec.add_documents(docs)
-                print(f"Successfully stored memories")
+                self._log(f"Successfully stored memories")
 
         # Use langchain_litellm's ChatLiteLLM for memory manager directly
         # No wrapper to avoid potential deadlocks
@@ -270,34 +277,34 @@ class BrainProxy:
     async def _retrieve_memories(self, tenant: str, user_text: str) -> str:
         """Retrieve relevant memories for the given user text."""
         if not self.enable_memory:
-            print(f"Memory disabled for tenant {tenant}")
+            self._log(f"Memory disabled for tenant {tenant}")
             return ""
             
-        print(f"Retrieving memories for tenant {tenant} with query: '{user_text[:30]}...'")
+        self._log(f"Retrieving memories for tenant {tenant} with query: '{user_text[:30]}...'")
         manager_tuple = self._get_mem_manager(tenant)
         if not manager_tuple:
-            print(f"No memory manager found for tenant {tenant}")
+            self._log(f"No memory manager found for tenant {tenant}")
             return ""
             
         _, search, _ = manager_tuple
         try:
-            print(f"Searching for memories with k={self.mem_top_k}")
+            self._log(f"Searching for memories with k={self.mem_top_k}")
             memories = await search(user_text, k=self.mem_top_k)
-            print(f"Found {len(memories)} memories")
+            self._log(f"Found {len(memories)} memories")
             
             if memories:
                 # Log first few characters of each memory for debugging
                 for i, memory in enumerate(memories):
                     preview = memory[:50] + "..." if len(memory) > 50 else memory
-                    print(f"Memory {i+1}: {preview}")
+                    self._log(f"Memory {i+1}: {preview}")
                     
                 memory_block = "\n".join(memories)
                 return memory_block
             else:
-                print("No memories found")
+                self._log("No memories found")
                 return ""
         except Exception as e:
-            print(f"Error retrieving memories: {e}")
+            self._log(f"Error retrieving memories: {e}")
             return ""
 
     async def _write_memories(
@@ -313,16 +320,16 @@ class BrainProxy:
         
         try:
             # Get memories from the manager
-            print(f"Extracting memories for tenant {tenant}")
+            self._log(f"Extracting memories for tenant {tenant}")
             raw_memories = await manager(conversation)
             
             # Debug logging to understand the format
-            print(f"Raw memory count: {len(raw_memories) if raw_memories else 0}")
-            if raw_memories:
+            self._log(f"Raw memory count: {len(raw_memories) if raw_memories else 0}")
+            if raw_memories and self.debug:
                 for i, mem in enumerate(raw_memories):
-                    print(f"Raw memory {i+1} type: {type(mem)}")
+                    self._log(f"Raw memory {i+1} type: {type(mem)}")
                     if hasattr(mem, 'id') and hasattr(mem, 'content'):
-                        print(f"  String representation: {str(mem)[:50]}")
+                        self._log(f"  String representation: {str(mem)[:50]}")
             
             # Convert ExtractedMemory objects to proper format
             if raw_memories:
@@ -375,7 +382,7 @@ class BrainProxy:
                                 longest_key = max(text_keys, key=len)
                                 formatted_mem = {"content": longest_key}
                                 proper_memories.append(formatted_mem)
-                                print(f"  Fixed complex memory format: {longest_key[:30]}...")
+                                self._log(f"  Fixed complex memory format: {longest_key[:30]}...")
                             else:
                                 # Fallback: concatenate all string values
                                 content_parts = []
@@ -412,27 +419,28 @@ class BrainProxy:
                         
                         # If nothing worked, skip this memory
                         else:
-                            print(f"  Could not extract content from memory: {type(mem)}")
+                            self._log(f"  Could not extract content from memory: {type(mem)}")
                             
                     except Exception as e:
-                        print(f"  Error formatting memory: {e}")
+                        self._log(f"  Error formatting memory: {e}")
                         continue
                 
-                print(f"Formatted {len(proper_memories)} memories properly")
+                self._log(f"Formatted {len(proper_memories)} memories properly")
                 
                 if proper_memories:
                     # Store the properly formatted memories
-                    print(f"Storing {len(proper_memories)} memories for tenant {tenant}")
+                    self._log(f"Storing {len(proper_memories)} memories for tenant {tenant}")
                     await store(proper_memories)
-                    print(f"Successfully stored memories")
-                    print(f"Memory storage complete")
+                    self._log(f"Successfully stored memories")
+                    self._log(f"Memory storage complete")
             else:
-                print("No memories to store")
+                self._log("No memories to store")
                 
         except Exception as e:
-            print(f"Error in memory processing: {e}")
-            import traceback
-            traceback.print_exc()
+            self._log(f"Error in memory processing: {e}")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
             # Continue with the request even if memory fails
 
     # ----------------------------------------------------------------
@@ -462,7 +470,7 @@ class BrainProxy:
                             raise ValueError(f"File too large: {part.file_data.name}")
                         files.append(part.file_data)
                     except Exception as e:
-                        print(f"Error decoding file: {e}")
+                        self._log(f"Error decoding file: {e}")
 
             if text_parts:
                 conv_msgs.append({"role": msg.role, "content": "\n".join(text_parts)})
@@ -475,7 +483,7 @@ class BrainProxy:
             return
         docs = []
         for file in files:
-            print(f"Ingesting file: {file.name} ({file.mime})")
+            self._log(f"Ingesting file: {file.name} ({file.mime})")
             try:
                 name = file.name.replace(" ", "_")
                 data = base64.b64decode(file.data)
@@ -486,7 +494,7 @@ class BrainProxy:
                 if text.strip():
                     docs.append(Document(page_content=text, metadata={"name": file.name}))
             except Exception as e:
-                print(f"Error ingesting file: {e}")
+                self._log(f"Error ingesting file: {e}")
 
         if docs:
             vec = self.vec_factory(tenant)
@@ -550,12 +558,12 @@ class BrainProxy:
             msgs, files = self._split_files(req.messages)
 
             if files:
-                print(f"Ingesting {len(files)} files for tenant {tenant}")
+                self._log(f"Ingesting {len(files)} files for tenant {tenant}")
                 await self._ingest_files(files, tenant)
 
             # LangMem retrieve
             if self.enable_memory:
-                print(f"Memory enabled for tenant {tenant}, processing message")
+                self._log(f"Memory enabled for tenant {tenant}, processing message")
                 user_text = (
                     msgs[-1]["content"]
                     if isinstance(msgs[-1]["content"], str)
@@ -563,10 +571,10 @@ class BrainProxy:
                         p["text"] for p in msgs[-1]["content"] if p["type"] == "text"
                     )
                 )
-                print(f"Extracting user text: '{user_text[:30]}...'")
+                self._log(f"Extracting user text: '{user_text[:30]}...'")
                 mem_block = await self._retrieve_memories(tenant, user_text)
                 if mem_block:
-                    print(f"Adding memory block to conversation: {len(mem_block)} chars")
+                    self._log(f"Adding memory block to conversation: {len(mem_block)} chars")
                     msgs = msgs[:-1] + [
                         {
                             "role": "system",
@@ -575,9 +583,9 @@ class BrainProxy:
                         msgs[-1],
                     ]
                 else:
-                    print("No memory block to add")
+                    self._log("No memory block to add")
             else:
-                print("Memory disabled for tenant {tenant}")
+                self._log(f"Memory disabled for tenant {tenant}")
 
             msgs = await self._rag(msgs, tenant)
 
