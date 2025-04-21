@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brain-proxy"
+version = "0.0.1"
+description = "OpenAI-compatible FastAPI router with Chroma + LangMem memory."
+authors = [
+    {name = "Pablo Schaffner", email = "pablo@puntorigen.com"}
+]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "fastapi",
+    "openai",
+    "langchain-chroma",
+    "langmem",
+    "tiktoken",
+    "pydantic",
+    "langchain-openai"
+]
+
+[project.urls]
+Homepage = "https://github.com/puntorigen/brain-proxy"
