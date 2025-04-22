@@ -189,6 +189,7 @@ class BrainProxy:
         auth_hook: Callable[[Request, str], Any] | None = None,
         usage_hook: Callable[[str, int, float], Any] | None = None,
         max_upload_mb: int = 20,
+        system_prompt: Optional[str] = None,
         debug: bool = False,
     ):
         # Initialize basic attributes first
@@ -207,6 +208,7 @@ class BrainProxy:
         self.usage_hook = usage_hook
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self._mem_managers: Dict[str, Any] = {}
+        self.system_prompt = system_prompt
         self.debug = debug
 
         # Initialize embeddings using litellm's synchronous embedding function
@@ -566,6 +568,17 @@ class BrainProxy:
                 self._log(f"Ingesting {len(files)} files for tenant {tenant}")
                 await self._ingest_files(files, tenant)
 
+            # Add global system prompt at the beginning if provided
+            if self.system_prompt:
+                self._log(f"Adding global system prompt: '{self.system_prompt[:30]}...'")
+                # Check if the first message is already a system message
+                if msgs and msgs[0].get("role") == "system":
+                    # Augment existing system message
+                    msgs[0]["content"] = f"{self.system_prompt}\n\n{msgs[0]['content']}"
+                else:
+                    # Add new system message at the beginning
+                    msgs = [{"role": "system", "content": self.system_prompt}] + msgs
+
             # LangMem retrieve
             if self.enable_memory:
                 self._log(f"Memory enabled for tenant {tenant}, processing message")
@@ -591,7 +604,7 @@ class BrainProxy:
                     self._log("No memory block to add")
             else:
                 self._log(f"Memory disabled for tenant {tenant}")
-
+            
             msgs = await self._rag(msgs, tenant)
 
             upstream_iter = await self._dispatch(

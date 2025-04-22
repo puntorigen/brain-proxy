@@ -21,6 +21,9 @@ dotenv.load_dotenv()
 # Enable debug mode for testing
 DEBUG_MODE = True
 
+# Example system prompt to test the new feature
+SYSTEM_PROMPT = "You are Claude, a friendly and helpful AI assistant. You are concise, respectful, and you always maintain a warm, conversational tone. You prefer to explain concepts using analogies and examples."
+
 app = FastAPI()
 
 # Example: instantiate your BrainProxy class
@@ -32,6 +35,8 @@ brain_proxy = BrainProxy(
     # Optional: customize memory settings
     enable_memory=True,
     mem_top_k=6,
+    # Add system_prompt parameter to test the new feature
+    system_prompt=SYSTEM_PROMPT,
     # Debug mode - will print detailed logs when set to True
     debug=DEBUG_MODE,
 )
@@ -49,5 +54,6 @@ def root():
             "default": brain_proxy.default_model,
             "memory": brain_proxy.memory_model,
             "embedding": brain_proxy.embedding_model
-        }
+        },
+        "system_prompt": brain_proxy.system_prompt,
     }

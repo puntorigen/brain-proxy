@@ -77,6 +77,7 @@ BrainProxy(
     
     # Customization
     extract_text=None,  # Custom text extraction function for files
+    system_prompt=None,  # Optional global system prompt for all conversations
     
     # Hooks
     manager_fn=None,  # Multi-agent manager hook
@@ -101,6 +102,19 @@ BrainProxy uses these default models if not explicitly specified:
 - `embedding_model`: "openai/text-embedding-3-small" - Used for vector embeddings
 
 These are all optional parameters - if you don't specify them, the default values will be used.
+
+#### System Prompt
+
+You can set a global system prompt that will be applied to all conversations:
+
+```python
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    system_prompt="You are Claude, a friendly and helpful AI assistant. You are concise, respectful, and you always maintain a warm, conversational tone. You prefer to explain concepts using analogies and examples."
+)
+```
+
+This system prompt is applied in a complementary way - it doesn't overwrite system prompts added by the memory or RAG processes. If there's already a system message at the beginning of the conversation, the global system prompt will be prepended to it. Otherwise, a new system message will be added.
 
 #### API Key Requirements
 
