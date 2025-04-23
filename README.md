@@ -78,6 +78,7 @@ BrainProxy(
     # Customization
     extract_text=None,  # Custom text extraction function for files
     system_prompt=None,  # Optional global system prompt for all conversations
+    temporal_awareness=True,  # Enable time-based memory filtering for temporal queries
     
     # Hooks
     manager_fn=None,  # Multi-agent manager hook
@@ -198,6 +199,134 @@ proxy = BrainProxy(
     embedding_model="azure/text-embedding-ada-002", 
 )
 ```
+
+### ⏰ Temporal Awareness
+
+The `temporal_awareness` parameter (default: `True`) enables the agent to understand and respond to time-based queries by intelligently filtering memories based on timestamps.
+
+When enabled, the agent can:
+- Understand relative time expressions like "yesterday," "last week," or "next month"
+- Filter memories based on when they were created
+- Respond accurately to questions about what happened during specific time periods
+
+#### How It Works
+
+When a user asks a question with temporal references like "What did I do yesterday?" or "What are my plans for next month?", the system:
+
+1. Detects the temporal expression in the query
+2. Converts it to a specific time range
+3. Filters memories that have timestamps within that range
+4. Returns only the relevant memories for that time period
+
+This creates a more natural conversational experience as the AI can maintain chronological awareness of events and respond appropriately to time-based queries.
+
+#### Example Implementation
+
+```python
+from fastapi import FastAPI
+from brain_proxy import BrainProxy
+import dotenv
+
+# Load environment variables
+dotenv.load_dotenv()
+
+app = FastAPI()
+
+# Initialize BrainProxy with temporal_awareness enabled
+brain_proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    memory_model="openai/gpt-4o-mini",
+    embedding_model="openai/text-embedding-3-small",
+    enable_memory=True,
+    temporal_awareness=True,  # Enable time-based memory filtering
+    debug=True,  # Set to True to see detailed logs
+)
+
+app.include_router(brain_proxy.router, prefix="/v1")
+
+@app.get("/")
+def root():
+    return {
+        "message": "Brain-proxy with temporal awareness is running!",
+        "models": {
+            "default": brain_proxy.default_model,
+            "memory": brain_proxy.memory_model,
+            "embedding": brain_proxy.embedding_model
+        },
+        "temporal_awareness": brain_proxy.temporal_awareness
+    }
+```
+
+#### Testing Temporal Awareness
+
+Here's how you can test the temporal awareness feature with curl commands:
+
+```bash
+# 1. Store a memory about something in the past
+curl -X POST http://localhost:8000/v1/my_tenant/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "openai/gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "Remember that I bought a car last week."}
+  ]
+}'
+
+# 2. Store a memory about something happening today
+curl -X POST http://localhost:8000/v1/my_tenant/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "openai/gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "Today I started learning Python programming."}
+  ]
+}'
+
+# 3. Store a memory about future plans
+curl -X POST http://localhost:8000/v1/my_tenant/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "openai/gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "I plan to visit Japan next month for a vacation."}
+  ]
+}'
+
+# 4. Query about past events
+curl -X POST http://localhost:8000/v1/my_tenant/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "openai/gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "What happened last week?"}
+  ]
+}'
+# Response will mention the car purchase
+
+# 5. Query about today's activities
+curl -X POST http://localhost:8000/v1/my_tenant/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "openai/gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "What did I do today?"}
+  ]
+}'
+# Response will mention Python programming
+
+# 6. Query about future plans
+curl -X POST http://localhost:8000/v1/my_tenant/chat/completions \
+-H "Content-Type: application/json" \
+-d '{
+  "model": "openai/gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "What are my plans for next month?"}
+  ]
+}'
+# Response will mention the Japan vacation
+```
+
+This feature significantly enhances the contextual awareness of conversations by providing chronologically accurate responses to time-based queries.
 
 ### 📄 Custom Text Extraction
 
