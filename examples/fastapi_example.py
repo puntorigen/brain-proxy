@@ -40,7 +40,7 @@ brain_proxy = BrainProxy(
     # Add system_prompt parameter to test the new feature
     system_prompt=SYSTEM_PROMPT,
     # Debug mode - will print detailed logs when set to True
-    # TODO: temporal_awareness=True,
+    temporal_awareness=True,
     # TODO: external=False, # only allows internal access (ask,chat,etc)
     debug=DEBUG_MODE,
 )

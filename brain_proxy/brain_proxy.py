@@ -233,6 +233,12 @@ class BrainProxy:
         if self.debug:
             print(message)
 
+    def _maybe_prefix(self, text: str) -> str:
+        """Return [timestamp] text if temporal_awareness on; else plain text."""
+        if self.temporal_awareness:
+            return f"[{datetime.now(timezone.utc).isoformat()}] {text}"
+        return text
+
     # ----------------------------------------------------------------
     # Memory helpers
     # ----------------------------------------------------------------
@@ -267,7 +273,7 @@ class BrainProxy:
                     now_iso = datetime.now(timezone.utc).isoformat()
                     docs.append(
                         Document(
-                            page_content=f"[{now_iso}] {content}",
+                            page_content=self._maybe_prefix(content),
                             metadata={
                                 "timestamp": now_iso
                             }
@@ -359,30 +365,30 @@ class BrainProxy:
                             if hasattr(mem.content, 'content'):
                                 # Extract content from the BaseModel
                                 content = mem.content.content
-                                formatted_mem = {"content": f"[{now_iso}] {content}"}
+                                formatted_mem = {"content": self._maybe_prefix(content)}
                                 proper_memories.append(formatted_mem)
                             elif hasattr(mem.content, 'model_dump'):
                                 # Extract content using model_dump method
                                 model_data = mem.content.model_dump()
                                 if 'content' in model_data:
-                                    formatted_mem = {"content": f"[{now_iso}] {model_data['content']}"}
+                                    formatted_mem = {"content": self._maybe_prefix(model_data['content'])}
                                     proper_memories.append(formatted_mem)
                                 else:
                                     # If no content field, use the whole model data as string
-                                    formatted_mem = {"content": f"[{now_iso}] {str(model_data)}"}
+                                    formatted_mem = {"content": self._maybe_prefix(str(model_data))}
                                     proper_memories.append(formatted_mem)
                             elif isinstance(mem.content, dict) and 'content' in mem.content:
                                 # Content is a dict with content field
-                                formatted_mem = {"content": f"[{now_iso}] {mem.content['content']}"}
+                                formatted_mem = {"content": self._maybe_prefix(mem.content['content'])}
                                 proper_memories.append(formatted_mem)
                             else:
                                 # Fallback for other types
-                                formatted_mem = {"content": f"[{now_iso}] {str(mem.content)}"}
+                                formatted_mem = {"content": self._maybe_prefix(str(mem.content))}
                                 proper_memories.append(formatted_mem)
                                 
                         # Case 2: Dictionary with 'content' key
                         elif isinstance(mem, dict) and 'content' in mem:
-                            formatted_mem = {"content": f"[{now_iso}] {str(mem['content'])}"}
+                            formatted_mem = {"content": self._maybe_prefix(str(mem['content']))}
                             proper_memories.append(formatted_mem)
                             
                         # Case 3: Malformed dictionaries with format {'content=': val, 'text': val}
@@ -394,7 +400,7 @@ class BrainProxy:
                             if text_keys:
                                 # Use the text key with actual content
                                 longest_key = max(text_keys, key=len)
-                                formatted_mem = {"content": f"[{now_iso}] {longest_key}"}
+                                formatted_mem = {"content": self._maybe_prefix(longest_key)}
                                 proper_memories.append(formatted_mem)
                                 self._log(f"  Fixed complex memory format: {longest_key[:30]}...")
                             else:
@@ -408,27 +414,27 @@ class BrainProxy:
                                         
                                 if content_parts:
                                     content = " ".join(content_parts)
-                                    formatted_mem = {"content": f"[{now_iso}] {content}"}
+                                    formatted_mem = {"content": self._maybe_prefix(content)}
                                     proper_memories.append(formatted_mem)
                                 else:
                                     # Last resort: use content= value
-                                    formatted_mem = {"content": f"[{now_iso}] {str(mem['content='])}"}
+                                    formatted_mem = {"content": self._maybe_prefix(str(mem['content=']))}
                                     proper_memories.append(formatted_mem)
                             
                         # Case 4: String value
                         elif isinstance(mem, str):
-                            formatted_mem = {"content": f"[{now_iso}] {mem}"}
+                            formatted_mem = {"content": self._maybe_prefix(mem)}
                             proper_memories.append(formatted_mem)
                             
                         # Case 5: Any other object with __dict__ attribute
                         elif hasattr(mem, '__dict__'):
                             mem_dict = mem.__dict__
                             if 'content' in mem_dict:
-                                formatted_mem = {"content": f"[{now_iso}] {str(mem_dict['content'])}"}
+                                formatted_mem = {"content": self._maybe_prefix(str(mem_dict['content']))}
                                 proper_memories.append(formatted_mem)
                             else:
                                 # Use the entire object representation
-                                formatted_mem = {"content": f"[{now_iso}] {str(mem)}"}
+                                formatted_mem = {"content": self._maybe_prefix(str(mem))}
                                 proper_memories.append(formatted_mem)
                         
                         # If nothing worked, skip this memory
@@ -647,8 +653,9 @@ class BrainProxy:
                     + [
                         {
                             "role": "assistant",
-                            "content": f"[{datetime.now(timezone.utc).isoformat()}] "
-                                + upstream_iter.choices[0].message.content,
+                            "content": self._maybe_prefix(
+                                upstream_iter.choices[0].message.content
+                            ),
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                         }
                     ]
@@ -681,7 +688,7 @@ class BrainProxy:
                     + [
                         {
                             "role": "assistant", 
-                            "content": f"[{datetime.now(timezone.utc).isoformat()}] " + "".join(buf),
+                            "content": self._maybe_prefix("".join(buf)),
                             "timestamp": datetime.now(timezone.utc).isoformat()
                         }
                     ]
