@@ -20,7 +20,10 @@ dependencies = [
     "pydantic",
     "langchain-openai",
     "numpy<2.0.0",
-    "litellm"
+    "litellm",
+    "langchain_litellm",
+    "dateparser",
+    "async-promptic"
 ]
 
 [project.urls]

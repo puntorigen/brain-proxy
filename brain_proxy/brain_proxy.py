@@ -6,6 +6,7 @@ pip install fastapi openai langchain-chroma langmem tiktoken
 
 from __future__ import annotations
 import asyncio, base64, hashlib, json, time, re
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
@@ -20,10 +21,8 @@ from langchain.storage import LocalFileStore
 from langchain.schema import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_litellm import ChatLiteLLM
-import anyio
-import os
-import re
 from pydantic import BaseModel
+from .temporal_utils import extract_timerange
 
 # For creating proper Memory objects
 class Memory(BaseModel):
@@ -51,6 +50,9 @@ class ContentPart(BaseModel):
 class ChatMessage(BaseModel):
     role: str
     content: str | List[ContentPart]
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
 
 
 class ChatRequest(BaseModel):
@@ -189,6 +191,7 @@ class BrainProxy:
         auth_hook: Callable[[Request, str], Any] | None = None,
         usage_hook: Callable[[str, int, float], Any] | None = None,
         max_upload_mb: int = 20,
+        temporal_awareness: bool = True, # enable temporal awareness (time tracking of knowledge)
         system_prompt: Optional[str] = None,
         debug: bool = False,
     ):
@@ -208,6 +211,7 @@ class BrainProxy:
         self.usage_hook = usage_hook
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self._mem_managers: Dict[str, Any] = {}
+        self.temporal_awareness = temporal_awareness
         self.system_prompt = system_prompt
         self.debug = debug
 
@@ -260,7 +264,15 @@ class BrainProxy:
                     else:
                         content = str(m)
                     
-                    docs.append(Document(page_content=content))
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    docs.append(
+                        Document(
+                            page_content=f"[{now_iso}] {content}",
+                            metadata={
+                                "timestamp": now_iso
+                            }
+                        )
+                    )
                 except Exception as e:
                     self._log(f"Error processing memory: {e}")
             
@@ -277,37 +289,36 @@ class BrainProxy:
         return self._mem_managers[tenant]
 
     async def _retrieve_memories(self, tenant: str, user_text: str) -> str:
-        """Retrieve relevant memories for the given user text."""
+        """Return a '\n'-joined block of relevant memories (filtered by time if possible)."""
         if not self.enable_memory:
             self._log(f"Memory disabled for tenant {tenant}")
             return ""
-            
-        self._log(f"Retrieving memories for tenant {tenant} with query: '{user_text[:30]}...'")
-        manager_tuple = self._get_mem_manager(tenant)
-        if not manager_tuple:
+
+        mgr, search, _ = self._get_mem_manager(tenant)
+        if not mgr:
             self._log(f"No memory manager found for tenant {tenant}")
             return ""
-            
-        _, search, _ = manager_tuple
-        try:
-            self._log(f"Searching for memories with k={self.mem_top_k}")
-            memories = await search(user_text, k=self.mem_top_k)
-            self._log(f"Found {len(memories)} memories")
-            
-            if memories:
-                # Log first few characters of each memory for debugging
-                for i, memory in enumerate(memories):
-                    preview = memory[:50] + "..." if len(memory) > 50 else memory
-                    self._log(f"Memory {i+1}: {preview}")
-                    
-                memory_block = "\n".join(memories)
-                return memory_block
-            else:
-                self._log("No memories found")
-                return ""
-        except Exception as e:
-            self._log(f"Error retrieving memories: {e}")
-            return ""
+
+        # 1️⃣  broad search
+        raw = await search(user_text, k=self.mem_top_k * 3)
+
+        # 2️⃣  try to detect a date / relative phrase
+        timerange = extract_timerange(user_text) if self.temporal_awareness else None
+        if timerange:
+            start, end = timerange
+            filtered = []
+            for mem in raw:
+                # we stored ISO timestamps in the memory doc’s metadata and also
+                # prefixed them in text like “[2025-06-20T14:03:00+00:00] …”
+                m = re.match(r"\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]", mem)
+                ts = m.group(1) if m else ""
+                if ts and start.isoformat() <= ts <= end.isoformat():
+                    filtered.append(mem)
+            memories = filtered or raw
+        else:
+            memories = raw
+
+        return "\\n".join(memories[: self.mem_top_k])
 
     async def _write_memories(
         self, tenant: str, conversation: List[Dict[str, Any]]
@@ -343,34 +354,35 @@ class BrainProxy:
                         # Extract the content properly based on the object type
                         
                         # Case 1: ExtractedMemory named tuple (id, content)
+                        now_iso = datetime.now(timezone.utc).isoformat()
                         if hasattr(mem, 'id') and hasattr(mem, 'content'):
                             if hasattr(mem.content, 'content'):
                                 # Extract content from the BaseModel
                                 content = mem.content.content
-                                formatted_mem = {"content": content}
+                                formatted_mem = {"content": f"[{now_iso}] {content}"}
                                 proper_memories.append(formatted_mem)
                             elif hasattr(mem.content, 'model_dump'):
                                 # Extract content using model_dump method
                                 model_data = mem.content.model_dump()
                                 if 'content' in model_data:
-                                    formatted_mem = {"content": model_data['content']}
+                                    formatted_mem = {"content": f"[{now_iso}] {model_data['content']}"}
                                     proper_memories.append(formatted_mem)
                                 else:
                                     # If no content field, use the whole model data as string
-                                    formatted_mem = {"content": str(model_data)}
+                                    formatted_mem = {"content": f"[{now_iso}] {str(model_data)}"}
                                     proper_memories.append(formatted_mem)
                             elif isinstance(mem.content, dict) and 'content' in mem.content:
                                 # Content is a dict with content field
-                                formatted_mem = {"content": mem.content['content']}
+                                formatted_mem = {"content": f"[{now_iso}] {mem.content['content']}"}
                                 proper_memories.append(formatted_mem)
                             else:
                                 # Fallback for other types
-                                formatted_mem = {"content": str(mem.content)}
+                                formatted_mem = {"content": f"[{now_iso}] {str(mem.content)}"}
                                 proper_memories.append(formatted_mem)
                                 
                         # Case 2: Dictionary with 'content' key
                         elif isinstance(mem, dict) and 'content' in mem:
-                            formatted_mem = {"content": str(mem['content'])}
+                            formatted_mem = {"content": f"[{now_iso}] {str(mem['content'])}"}
                             proper_memories.append(formatted_mem)
                             
                         # Case 3: Malformed dictionaries with format {'content=': val, 'text': val}
@@ -382,7 +394,7 @@ class BrainProxy:
                             if text_keys:
                                 # Use the text key with actual content
                                 longest_key = max(text_keys, key=len)
-                                formatted_mem = {"content": longest_key}
+                                formatted_mem = {"content": f"[{now_iso}] {longest_key}"}
                                 proper_memories.append(formatted_mem)
                                 self._log(f"  Fixed complex memory format: {longest_key[:30]}...")
                             else:
@@ -396,27 +408,27 @@ class BrainProxy:
                                         
                                 if content_parts:
                                     content = " ".join(content_parts)
-                                    formatted_mem = {"content": content}
+                                    formatted_mem = {"content": f"[{now_iso}] {content}"}
                                     proper_memories.append(formatted_mem)
                                 else:
                                     # Last resort: use content= value
-                                    formatted_mem = {"content": str(mem['content='])}
+                                    formatted_mem = {"content": f"[{now_iso}] {str(mem['content='])}"}
                                     proper_memories.append(formatted_mem)
                             
                         # Case 4: String value
                         elif isinstance(mem, str):
-                            formatted_mem = {"content": mem}
+                            formatted_mem = {"content": f"[{now_iso}] {mem}"}
                             proper_memories.append(formatted_mem)
                             
                         # Case 5: Any other object with __dict__ attribute
                         elif hasattr(mem, '__dict__'):
                             mem_dict = mem.__dict__
                             if 'content' in mem_dict:
-                                formatted_mem = {"content": str(mem_dict['content'])}
+                                formatted_mem = {"content": f"[{now_iso}] {str(mem_dict['content'])}"}
                                 proper_memories.append(formatted_mem)
                             else:
                                 # Use the entire object representation
-                                formatted_mem = {"content": str(mem)}
+                                formatted_mem = {"content": f"[{now_iso}] {str(mem)}"}
                                 proper_memories.append(formatted_mem)
                         
                         # If nothing worked, skip this memory
@@ -499,7 +511,13 @@ class BrainProxy:
                 path.write_bytes(data)
                 text = self.extract_text(path, file.mime)
                 if text.strip():
-                    docs.append(Document(page_content=text, metadata={"name": file.name}))
+                    docs.append(Document(
+                        page_content=text,
+                        metadata={
+                            "name": file.name,
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        }
+                    ))
             except Exception as e:
                 self._log(f"Error ingesting file: {e}")
 
@@ -579,6 +597,14 @@ class BrainProxy:
                     # Add new system message at the beginning
                     msgs = [{"role": "system", "content": self.system_prompt}] + msgs
 
+            # ── inject current UTC time so the model understands “hoy”, “ayer”… ──
+            if self.temporal_awareness:
+                now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                msgs = (
+                    [{"role": "system", "content": f"Current UTC time is {now_iso}."}]
+                    + msgs
+                )
+
             # LangMem retrieve
             if self.enable_memory:
                 self._log(f"Memory enabled for tenant {tenant}, processing message")
@@ -615,7 +641,18 @@ class BrainProxy:
             if not req.stream:
                 # No need to await here since _dispatch already returns the complete response
                 response_data = upstream_iter.model_dump()
-                await self._write_memories(tenant, msgs + [upstream_iter.choices[0].message.model_dump()])
+                await self._write_memories(
+                    tenant, 
+                    msgs 
+                    + [
+                        {
+                            "role": "assistant",
+                            "content": f"[{datetime.now(timezone.utc).isoformat()}] "
+                                + upstream_iter.choices[0].message.content,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                    ]
+                )
                 if self.usage_hook and upstream_iter.usage:
                     await _maybe(
                         self.usage_hook,
@@ -639,7 +676,15 @@ class BrainProxy:
                     yield f"data: {json.dumps(payload)}\n\n"
                 yield "data: [DONE]\n\n"
                 await self._write_memories(
-                    tenant, msgs + [{"role": "assistant", "content": "".join(buf)}]
+                    tenant, 
+                    msgs 
+                    + [
+                        {
+                            "role": "assistant", 
+                            "content": f"[{datetime.now(timezone.utc).isoformat()}] " + "".join(buf),
+                            "timestamp": datetime.now(timezone.utc).isoformat()
+                        }
+                    ]
                 )
                 if self.usage_hook:
                     await _maybe(self.usage_hook, tenant, tokens, time.time() - t0)

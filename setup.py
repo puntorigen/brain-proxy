@@ -21,6 +21,9 @@ setup(
         "langchain-openai",
         "numpy<2.0.0",
         "litellm",
+        "langchain_litellm",
+        "dateparser",
+        "async-promptic"
     ],
     include_package_data=True,
 )

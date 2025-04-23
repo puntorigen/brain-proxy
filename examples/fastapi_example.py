@@ -12,8 +12,10 @@ Required environment variables:
 
 from fastapi import FastAPI
 # Adjust the import path below if brain_proxy is not installed as a package
-from brain_proxy import BrainProxy
+from brain_proxy import BrainProxy #, ask, chat, index_file, add_memory
 import dotenv, os
+# TODO create: ask,chat methods (compatible with langchain), index_file, add_memory (args: tenant, data)
+# TODO create method for erasing timespan memory/history with tenant (args: tenant, timespan)
 
 # Load environment variables from .env file
 dotenv.load_dotenv()
@@ -38,6 +40,8 @@ brain_proxy = BrainProxy(
     # Add system_prompt parameter to test the new feature
     system_prompt=SYSTEM_PROMPT,
     # Debug mode - will print detailed logs when set to True
+    # TODO: temporal_awareness=True,
+    # TODO: external=False, # only allows internal access (ask,chat,etc)
     debug=DEBUG_MODE,
 )
 
