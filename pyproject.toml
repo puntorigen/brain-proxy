@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brain-proxy"
-version = "0.0.7"
+version = "0.0.8"
 description = "OpenAI-compatible FastAPI router with Chroma + LangMem memory."
 authors = [
     {name = "Pablo Schaffner", email = "pablo@puntorigen.com"}
@@ -23,7 +23,8 @@ dependencies = [
     "litellm",
     "langchain_litellm",
     "dateparser",
-    "async-promptic"
+    "async-promptic",
+    "httpx"
 ]
 
 [project.urls]

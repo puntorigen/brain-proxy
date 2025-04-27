@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="brain-proxy",
-    version="0.0.7",
+    version="0.0.8",
     description="OpenAI-compatible FastAPI router with Chroma + LangMem memory.",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
@@ -23,7 +23,8 @@ setup(
         "litellm",
         "langchain_litellm",
         "dateparser",
-        "async-promptic"
+        "async-promptic",
+        "httpx"
     ],
     include_package_data=True,
 )

@@ -553,6 +553,86 @@ for chunk in stream:
 
 ---
 
+## 🔗 LangChain Integration
+
+brain-proxy now provides a LangChain-compatible model interface, making it easy to use in LangChain-based applications and frameworks like CrewAI and LangGraph.
+
+### Basic Usage
+
+The most common way to use brain-proxy with LangChain is to connect to an existing brain-proxy service:
+
+```python
+from brain_proxy import BrainProxyLangChainModel
+from langchain.chains import ConversationChain
+
+# Create LangChain model pointing to brain-proxy service
+model = BrainProxyLangChainModel(
+    tenant="my_tenant",
+    base_url="http://localhost:8000/v1",  # Optional, this is the default
+    model="anthropic/claude-3-opus",  # Optional, uses brain-proxy default if not specified
+    streaming=True  # Optional
+)
+
+# Use in any LangChain application
+chain = ConversationChain(llm=model)
+response = await chain.ainvoke({"input": "Hello, how are you?"})
+```
+
+### Advanced Agent Usage
+
+Here's how to use brain-proxy with LangChain's agent framework:
+
+```python
+from brain_proxy import BrainProxyLangChainModel
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain.tools import Tool
+
+# Create model instance
+model = BrainProxyLangChainModel(
+    tenant="my_tenant",
+    base_url="https://your-brain-proxy.com/v1",  # Point to your brain-proxy service
+    streaming=True
+)
+
+# Configure your agent and tools
+tools = [...]  # Your tools here
+agent = create_openai_tools_agent(model, tools)
+agent_executor = AgentExecutor(agent=agent, tools=tools)
+
+# Run the agent
+result = await agent_executor.ainvoke({"input": "What's the weather like?"})
+```
+
+### Direct Instance Usage (Advanced)
+
+For advanced use cases, you can also create a BrainProxyLangChainModel from a local BrainProxy instance:
+
+```python
+from brain_proxy import BrainProxy, BrainProxyLangChainModel
+
+# Initialize BrainProxy
+brain_proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    system_prompt="You are a helpful AI assistant"
+)
+
+# Create LangChain model from instance
+model = BrainProxyLangChainModel(
+    tenant="my_tenant",
+    brain_proxy=brain_proxy,
+    streaming=True
+)
+```
+
+The LangChain integration supports:
+- Streaming responses with proper callback handling
+- Memory and RAG features through brain-proxy's built-in capabilities
+- Multi-tenant isolation
+- All LiteLLM-supported models
+- Async-first design for optimal performance
+
+---
+
 ## ⚡️ Model selection
 
 By default, brain-proxy now uses [LiteLLM](https://github.com/BerriAI/litellm) under the hood. This means you can specify any supported model using the `provider/model` format:
