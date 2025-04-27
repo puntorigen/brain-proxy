@@ -668,6 +668,89 @@ Files are saved in tenant-specific directories, parsed, embedded, and used in RA
 
 ---
 
+## 🛠️ Tools Support
+
+The `/chat/completions` endpoint supports OpenAI-compatible function calling and tools:
+
+```json
+{
+  "model": "openai/gpt-4o-mini",
+  "messages": [{"role": "user", "content": "What's the weather like?"}],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "The location to get weather for"
+            }
+          },
+          "required": ["location"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
+```
+
+The response will include tool calls in the standard OpenAI format:
+
+```json
+{
+  "id": "...",
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_xyz",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"location\": \"New York\"}"
+        }
+      }]
+    }
+  }]
+}
+```
+
+You can then send the tool outputs back in your next message:
+
+```json
+{
+  "model": "openai/gpt-4o-mini",
+  "messages": [
+    {"role": "user", "content": "What's the weather like?"},
+    {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_xyz",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"location\": \"New York\"}"
+        }
+      }]
+    },
+    {
+      "role": "tool",
+      "content": "{\"temperature\": 72, \"conditions\": \"sunny\"}",
+      "tool_call_id": "call_xyz"
+    }
+  ]
+}
+```
+
+---
+
 ## 🧾 Custom PDF extractor example
 
 ```python
