@@ -511,6 +511,33 @@ response = openai.ChatCompletion.create(
 print(response["choices"][0]["message"]["content"])
 ```
 
+### Function Calling
+
+brain-proxy supports OpenAI-compatible function calling through the tools parameter in requests:
+
+```python
+response = openai.ChatCompletion.create(
+    model="openai/gpt-4o",
+    messages=[{"role": "user", "content": "What time is it in UTC?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current time in UTC",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    }]
+)
+
+# The model may respond with a function call
+if response.choices[0].message.tool_calls:
+    tool_call = response.choices[0].message.tool_calls[0]
+    print(f"Function called: {tool_call.function.name}")
+```
+
 ### Streaming:
 
 ```python

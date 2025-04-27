@@ -59,6 +59,7 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     messages: List[ChatMessage]
     stream: Optional[bool] = False
+    tools: Optional[List[Dict[str, Any]]] = None  # OpenAI-compatible tools format
 
 
 # -------------------------------------------------------------------
@@ -562,18 +563,19 @@ class BrainProxy:
     # ----------------------------------------------------------------
     # Upstream dispatch
     # ----------------------------------------------------------------
-    async def _dispatch(self, msgs, model: str, *, stream: bool):
+    async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None):
         """Dispatch to litellm API"""
-        if stream:
-            return await acompletion(
-                model=model, messages=msgs, stream=stream
-            )
-        else:
-            # For non-streaming responses, we need to await the response directly
-            return await acompletion(
-                model=model, messages=msgs, stream=False
-            )
-
+        kwargs = {
+            "model": model,
+            "messages": msgs,
+            "stream": stream
+        }
+        
+        # Add tools to kwargs if they are provided in the request
+        if tools:
+            kwargs["tools"] = tools
+            
+        return await acompletion(**kwargs)
 
     # ----------------------------------------------------------------
     # FastAPI route
@@ -640,7 +642,10 @@ class BrainProxy:
             msgs = await self._rag(msgs, tenant)
 
             upstream_iter = await self._dispatch(
-                msgs, req.model or self.default_model, stream=req.stream
+                msgs, 
+                req.model or self.default_model, 
+                stream=req.stream,
+                tools=req.tools
             )
             t0 = time.time()
 
@@ -707,9 +712,7 @@ class BrainProxy:
 from fastapi import FastAPI
 from brain_proxy import BrainProxy
 
-proxy = BrainProxy(
-    #openai_api_key="sk-…",
-)
+proxy = BrainProxy()
 
 app = FastAPI()
 app.include_router(proxy.router, prefix="/v1")
