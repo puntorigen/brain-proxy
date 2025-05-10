@@ -23,6 +23,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_litellm import ChatLiteLLM
 from pydantic import BaseModel
 from .temporal_utils import extract_timerange
+from .upstash_adapter import upstash_vec_factory
 
 # For creating proper Memory objects
 class Memory(BaseModel):
@@ -177,7 +178,7 @@ class BrainProxy:
     def __init__(
         self,
         *,
-        vector_store_factory: Callable[[str, Any], Chroma] = default_vector_store_factory,
+        vector_store_factory: Callable[[str, Any], Chroma | UpstashVectorStore] = default_vector_store_factory,
         # memory settings
         enable_memory: bool = True,
         memory_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-35-turbo"
@@ -195,6 +196,9 @@ class BrainProxy:
         temporal_awareness: bool = True, # enable temporal awareness (time tracking of knowledge)
         system_prompt: Optional[str] = None,
         debug: bool = False,
+        # Upstash settings
+        upstash_rest_url: Optional[str] = None,
+        upstash_rest_token: Optional[str] = None,
     ):
         # Initialize basic attributes first
         self.storage_dir = Path(storage_dir)
@@ -215,6 +219,8 @@ class BrainProxy:
         self.temporal_awareness = temporal_awareness
         self.system_prompt = system_prompt
         self.debug = debug
+        self.upstash_rest_url = upstash_rest_url
+        self.upstash_rest_token = upstash_rest_token
 
         # Initialize embeddings using litellm's synchronous embedding function
         underlying_embeddings = LiteLLMEmbeddings(model=self.embedding_model)
@@ -225,7 +231,17 @@ class BrainProxy:
             namespace=self.embedding_model
         )
         
-        self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings)
+        # Initialize vector store factory
+        if upstash_rest_url and upstash_rest_token:
+            self.vec_factory = lambda tenant: upstash_vec_factory(
+                f"vec_{tenant}",
+                self.embeddings,
+                upstash_rest_url,
+                upstash_rest_token
+            )
+        else:
+            self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings)
+        
         self.router = APIRouter()
         self._mount()
 

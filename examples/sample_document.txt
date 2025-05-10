@@ -1,0 +1,11 @@
+This is a sample document for testing file uploads.
+
+It contains information about the company Acme Corporation:
+
+- Founded in 1945
+- Specializes in manufacturing widgets and gadgets
+- Headquartered in San Francisco, California
+- CEO: John Smith
+- Annual revenue: $500 million
+
+The company is planning to expand into the European market next year with offices in London and Berlin.
