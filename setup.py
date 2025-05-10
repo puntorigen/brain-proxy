@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="brain-proxy",
-    version="0.0.9",
+    version="0.1.4",
     description="OpenAI-compatible FastAPI router with Chroma + LangMem memory.",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
@@ -25,7 +25,7 @@ setup(
         "dateparser",
         "async-promptic",
         "httpx",
-        "upstash-vector"  # Add Upstash Vector dependency
+        "upstash_vector"  # Add Upstash Vector dependency
     ],
     include_package_data=True,
 )

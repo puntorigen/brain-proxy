@@ -77,12 +77,29 @@ async def _maybe(fn, *a, **k):
 # -------------------------------------------------------------------
 # Vector store factories
 # -------------------------------------------------------------------
-def chroma_vec_factory(collection_name: str, embeddings) -> Chroma:
-    return Chroma(
-        collection_name=collection_name,
-        persist_directory=f".chroma/{collection_name}",
-        embedding_function=embeddings,
-    )
+class ChromaAsyncWrapper:
+    """Async wrapper for ChromaDB to maintain consistency with Upstash adapter."""
+    
+    def __init__(self, collection_name: str, embeddings):
+        self.chroma = Chroma(
+            collection_name=collection_name,
+            persist_directory=f".chroma/{collection_name}",
+            embedding_function=embeddings,
+        )
+    
+    async def add_documents(self, documents: List[Document]) -> None:
+        """Add documents to ChromaDB asynchronously."""
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self.chroma.add_documents, documents)
+    
+    async def similarity_search(self, query: str, k: int = 4) -> List[Document]:
+        """Run similarity search asynchronously."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.chroma.similarity_search, query, k)
+
+def chroma_vec_factory(collection_name: str, embeddings) -> ChromaAsyncWrapper:
+    """Create a new async ChromaDB wrapper instance."""
+    return ChromaAsyncWrapper(collection_name, embeddings)
 
 def default_vector_store_factory(tenant, embeddings):
     return chroma_vec_factory(f"vec_{tenant}", embeddings)
@@ -178,7 +195,7 @@ class BrainProxy:
     def __init__(
         self,
         *,
-        vector_store_factory: Callable[[str, Any], Chroma | UpstashVectorStore] = default_vector_store_factory,
+        vector_store_factory: Callable[[str, Any], ChromaAsyncWrapper | UpstashVectorStore] = default_vector_store_factory,
         # memory settings
         enable_memory: bool = True,
         memory_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-35-turbo"
@@ -267,7 +284,7 @@ class BrainProxy:
         # use the tenant's chroma collection for memory as well
         vec = self.vec_factory(f"{tenant}_memory")
         async def _search_mem(query: str, k: int):
-            docs = vec.similarity_search(query, k=k)
+            docs = await vec.similarity_search(query, k=k)
             return [d.page_content for d in docs]
 
         async def _store_mem(memories: List[Any]):
@@ -301,7 +318,7 @@ class BrainProxy:
             
             if docs:
                 self._log(f"Storing {len(docs)} memories for tenant {tenant}")
-                vec.add_documents(docs)
+                await vec.add_documents(docs)
                 self._log(f"Successfully stored memories")
 
         # Use langchain_litellm's ChatLiteLLM for memory manager directly
@@ -562,7 +579,7 @@ class BrainProxy:
         if not query:
             return msgs
 
-        docs = vec.similarity_search(query, k=k)
+        docs = await vec.similarity_search(query, k=k)
         if not docs:
             return msgs
 

@@ -26,6 +26,11 @@ class UpstashVectorStore:
         """
         self.collection_name = collection_name
         self.embedding_function = embedding_function
+        
+        # Ensure URL has protocol
+        if not rest_url.startswith(('http://', 'https://')):
+            rest_url = f'https://{rest_url}'
+            
         self.index = Index(url=rest_url, token=rest_token)
 
     async def add_documents(self, documents: List[Document]) -> None:
@@ -71,24 +76,40 @@ class UpstashVectorStore:
 
         # Search Upstash (run sync query in thread pool)
         loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            None,
-            partial(
-                self.index.query,
-                vector=query_embedding,
-                namespace=self.collection_name,
-                top_k=k
+        try:
+            results = await loop.run_in_executor(
+                None,
+                partial(
+                    self.index.query,
+                    vector=query_embedding,
+                    namespace=self.collection_name,
+                    top_k=k,
+                    include_metadata=True
+                )
             )
-        )
+        except Exception:
+            return []
 
         # Convert to Documents
         documents = []
         for result in results:
-            doc = Document(
-                page_content=result.metadata["content"],
-                metadata={k: v for k, v in result.metadata.items() if k != "content"}
-            )
-            documents.append(doc)
+            try:
+                # Upstash returns a list of QueryResults with id, score, vector, and metadata
+                metadata = result.metadata
+                if metadata is None:
+                    continue
+                    
+                content = metadata.get("content")
+                if content is None:
+                    continue
+                    
+                doc = Document(
+                    page_content=content,
+                    metadata={k: v for k, v in metadata.items() if k != "content"}
+                )
+                documents.append(doc)
+            except Exception:
+                continue
 
         return documents
 
