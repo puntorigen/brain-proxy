@@ -6,6 +6,7 @@ pip install fastapi openai langchain-chroma langmem tiktoken
 
 from __future__ import annotations
 import asyncio, base64, hashlib, json, time, re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional
@@ -80,29 +81,43 @@ async def _maybe(fn, *a, **k):
 class ChromaAsyncWrapper:
     """Async wrapper for ChromaDB to maintain consistency with Upstash adapter."""
     
-    def __init__(self, collection_name: str, embeddings):
+    def __init__(self, collection_name: str, embeddings, max_workers: int = 10):
         self.chroma = Chroma(
             collection_name=collection_name,
             persist_directory=f".chroma/{collection_name}",
             embedding_function=embeddings,
         )
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
     
     async def add_documents(self, documents: List[Document]) -> None:
         """Add documents to ChromaDB asynchronously."""
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.chroma.add_documents, documents)
+        await asyncio.get_running_loop().run_in_executor(
+            self._executor,
+            self.chroma.add_documents,
+            documents
+        )
     
     async def similarity_search(self, query: str, k: int = 4) -> List[Document]:
         """Run similarity search asynchronously."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.chroma.similarity_search, query, k)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._executor,
+            self.chroma.similarity_search,
+            query,
+            k
+        )
 
-def chroma_vec_factory(collection_name: str, embeddings) -> ChromaAsyncWrapper:
-    """Create a new async ChromaDB wrapper instance."""
-    return ChromaAsyncWrapper(collection_name, embeddings)
+def chroma_vec_factory(collection_name: str, embeddings, max_workers: int = 10) -> ChromaAsyncWrapper:
+    """Create a new async ChromaDB wrapper instance.
+    
+    Args:
+        collection_name: Name of the collection
+        embeddings: LangChain embeddings interface
+        max_workers: Maximum number of threads in the thread pool (default: 10)
+    """
+    return ChromaAsyncWrapper(collection_name, embeddings, max_workers=max_workers)
 
-def default_vector_store_factory(tenant, embeddings):
-    return chroma_vec_factory(f"vec_{tenant}", embeddings)
+def default_vector_store_factory(tenant, embeddings, max_workers: int = 10):
+    return chroma_vec_factory(f"vec_{tenant}", embeddings, max_workers=max_workers)
 
 
 # -------------------------------------------------------------------
@@ -195,7 +210,7 @@ class BrainProxy:
     def __init__(
         self,
         *,
-        vector_store_factory: Callable[[str, Any], ChromaAsyncWrapper | UpstashVectorStore] = default_vector_store_factory,
+        vector_store_factory: Callable[[str, Any, int], ChromaAsyncWrapper | UpstashVectorStore] = default_vector_store_factory,
         # memory settings
         enable_memory: bool = True,
         memory_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-35-turbo"
@@ -216,6 +231,7 @@ class BrainProxy:
         # Upstash settings
         upstash_rest_url: Optional[str] = None,
         upstash_rest_token: Optional[str] = None,
+        max_workers: int = 10,
     ):
         # Initialize basic attributes first
         self.storage_dir = Path(storage_dir)
@@ -248,16 +264,19 @@ class BrainProxy:
             namespace=self.embedding_model
         )
         
-        # Initialize vector store factory
+        # Set up vector store factory
         if upstash_rest_url and upstash_rest_token:
+            # Use Upstash if credentials are provided
             self.vec_factory = lambda tenant: upstash_vec_factory(
-                f"vec_{tenant}",
+                tenant,
                 self.embeddings,
                 upstash_rest_url,
-                upstash_rest_token
+                upstash_rest_token,
+                max_workers=max_workers
             )
         else:
-            self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings)
+            # Otherwise use ChromaDB
+            self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings, max_workers=max_workers)
         
         self.router = APIRouter()
         self._mount()

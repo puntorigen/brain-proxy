@@ -4,6 +4,7 @@ from langchain.embeddings.base import Embeddings
 from upstash_vector import Index
 from datetime import datetime, timezone
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 class UpstashVectorStore:
@@ -15,6 +16,7 @@ class UpstashVectorStore:
         embedding_function: Embeddings,
         rest_url: str,
         rest_token: str,
+        max_workers: int = 10,
     ):
         """Initialize Upstash vector store.
         
@@ -32,6 +34,7 @@ class UpstashVectorStore:
             rest_url = f'https://{rest_url}'
             
         self.index = Index(url=rest_url, token=rest_token)
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
     async def add_documents(self, documents: List[Document]) -> None:
         """Add documents to the vector store."""
@@ -56,18 +59,22 @@ class UpstashVectorStore:
             vectors.append(vector)
 
         # Upload to Upstash in batches of 100
-        loop = asyncio.get_event_loop()
+        tasks = []
         for i in range(0, len(vectors), 100):
             batch = vectors[i:i + 100]
-            # Run synchronous upsert in a thread pool
-            await loop.run_in_executor(
-                None,
+            # Run synchronous upsert in thread pool
+            future = asyncio.get_running_loop().run_in_executor(
+                self._executor,
                 partial(
                     self.index.upsert,
                     vectors=batch,
                     namespace=self.collection_name
                 )
             )
+            tasks.append(future)
+        
+        # Wait for all batches to complete
+        await asyncio.gather(*tasks)
 
     async def similarity_search(self, query: str, k: int = 4) -> List[Document]:
         """Search for similar documents."""
@@ -75,10 +82,9 @@ class UpstashVectorStore:
         query_embedding = await self.embedding_function.aembed_query(query)
 
         # Search Upstash (run sync query in thread pool)
-        loop = asyncio.get_event_loop()
         try:
-            results = await loop.run_in_executor(
-                None,
+            results = await asyncio.get_running_loop().run_in_executor(
+                self._executor,
                 partial(
                     self.index.query,
                     vector=query_embedding,
@@ -113,11 +119,20 @@ class UpstashVectorStore:
 
         return documents
 
-def upstash_vec_factory(collection_name: str, embeddings, rest_url: str, rest_token: str) -> UpstashVectorStore:
-    """Factory function to create Upstash vector store instances."""
+def upstash_vec_factory(collection_name: str, embeddings, rest_url: str, rest_token: str, max_workers: int = 10) -> UpstashVectorStore:
+    """Factory function to create Upstash vector store instances.
+    
+    Args:
+        collection_name: Name of the collection
+        embeddings: LangChain embeddings interface
+        rest_url: Upstash REST URL
+        rest_token: Upstash REST token
+        max_workers: Maximum number of threads in the thread pool (default: 10)
+    """
     return UpstashVectorStore(
         collection_name=collection_name,
         embedding_function=embeddings,
         rest_url=rest_url,
-        rest_token=rest_token
+        rest_token=rest_token,
+        max_workers=max_workers
     )
