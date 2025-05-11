@@ -222,8 +222,9 @@ class BrainProxy:
         storage_dir: str | Path = "tenants",
         extract_text: Callable[[Path, str], str] | None = None,
         manager_fn: Callable[..., Any] | None = None,  # multi‑agent hook
-        auth_hook: Callable[[Request, str], Any] | None = None,
-        usage_hook: Callable[[str, int, float], Any] | None = None,
+        # auth hooks
+        auth_hook: Optional[Callable[[Request, str], Any]] = None,
+        usage_hook: Optional[Callable[[str, int, float], Any]] = None,
         max_upload_mb: int = 20,
         temporal_awareness: bool = True, # enable temporal awareness (time tracking of knowledge)
         system_prompt: Optional[str] = None,
@@ -353,13 +354,26 @@ class BrainProxy:
             self._log(f"Memory disabled for tenant {tenant}")
             return ""
 
+        # Get tenant-specific memories
         mgr, search, _ = self._get_mem_manager(tenant)
         if not mgr:
             self._log(f"No memory manager found for tenant {tenant}")
             return ""
 
-        # 1️⃣  broad search
-        raw = await search(user_text, k=self.mem_top_k * 3)
+        # Get global memories
+        global_mgr, global_search, _ = self._get_mem_manager('_global')
+
+        # 1️⃣  broad search in parallel
+        raw: List[str] = []
+        search_tasks = [search(user_text, k=self.mem_top_k * 3)]
+        if global_mgr:
+            search_tasks.append(global_search(user_text, k=self.mem_top_k * 3))
+        
+        # Gather results from all searches
+        results = await asyncio.gather(*search_tasks)
+        raw.extend(results[0])  # Tenant-specific memories
+        if global_mgr:
+            raw.extend(results[1])  # Global memories
 
         # 2️⃣  try to detect a date / relative phrase
         timerange = extract_timerange(user_text) if self.temporal_awareness else None
@@ -635,6 +649,7 @@ class BrainProxy:
     def _mount(self):
         @self.router.post("/{tenant}/chat/completions")
         async def chat(request: Request, tenant: str):
+            # Special handling auth
             if self.auth_hook:
                 await _maybe(self.auth_hook, request, tenant)
 
