@@ -20,9 +20,10 @@ from langchain.embeddings.base import Embeddings
 from langchain.embeddings import CacheBackedEmbeddings
 from langchain.storage import LocalFileStore
 from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_litellm import ChatLiteLLM
-from pydantic import BaseModel
+from langchain_litellm import ChatLiteLLM
 from .temporal_utils import extract_timerange
 from .upstash_adapter import upstash_vec_factory
 
@@ -220,7 +221,7 @@ class BrainProxy:
         # misc
         default_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-4"
         storage_dir: str | Path = "tenants",
-        extract_text: Callable[[Path, str], str] | None = None,
+        extract_text: Callable[[Path, str], str | List[Document]] | None = None,
         manager_fn: Callable[..., Any] | None = None,  # multi‑agent hook
         # auth hooks
         auth_hook: Optional[Callable[[Request, str], Any]] = None,
@@ -565,7 +566,7 @@ class BrainProxy:
         return conv_msgs, files
 
     async def _ingest_files(self, files: List[FileData], tenant: str):
-        """Ingest files into vector store"""
+        """Ingest files into vector store. Handles both raw text and pre-processed Documents."""
         if not files:
             return
         docs = []
@@ -578,19 +579,42 @@ class BrainProxy:
             self._log(f"Ingesting file: {file.name} ({file.mime})")
             try:
                 name = file.name.replace(" ", "_")
-                data = base64.b64decode(file.data)
-                # Store file in tenant-specific folder
-                path = tenant_dir / f"{_sha(data)[:8]}_{name}"
-                path.write_bytes(data)
-                text = self.extract_text(path, file.mime)
-                if text.strip():
-                    docs.append(Document(
-                        page_content=text,
-                        metadata={
-                            "name": file.name,
-                            "timestamp": datetime.now(timezone.utc).isoformat()
-                        }
-                    ))
+                path = tenant_dir / name
+                path.write_bytes(base64.b64decode(file.content))
+                
+                # Extract content using provided function
+                content = self.extract_text(path, file.mime)
+                
+                # Handle both string and Document list returns
+                if isinstance(content, str):
+                    # Split text into chunks if it's a string
+                    if content.strip():
+                        text_splitter = RecursiveCharacterTextSplitter(
+                            chunk_size=1000,
+                            chunk_overlap=200
+                        )
+                        chunks = text_splitter.split_text(content)
+                        timestamp = datetime.now(timezone.utc).isoformat()
+                        docs.extend([
+                            Document(
+                                page_content=chunk,
+                                metadata={
+                                    "name": file.name,
+                                    "timestamp": timestamp,
+                                    "chunk": i
+                                }
+                            ) for i, chunk in enumerate(chunks)
+                        ])
+                elif isinstance(content, list) and all(isinstance(d, Document) for d in content):
+                    # If we got pre-processed Documents, just add timestamp if not present
+                    timestamp = datetime.now(timezone.utc).isoformat()
+                    for doc in content:
+                        if "timestamp" not in doc.metadata:
+                            doc.metadata["timestamp"] = timestamp
+                        docs.append(doc)
+                else:
+                    self._log(f"Warning: extract_text returned invalid type for {file.name}")
+                    
             except Exception as e:
                 self._log(f"Error ingesting file: {e}")
 
