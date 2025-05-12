@@ -28,8 +28,40 @@ SYSTEM_PROMPT = "You are Claude, a friendly and helpful AI assistant. You are co
 
 app = FastAPI()
 
+# Define a dummy weather tool
+async def get_weather(location: str) -> dict:
+    """Dummy weather implementation that always returns sunny and 72°F"""
+    print("get_weather called with location:", location)
+    return {
+        "location": location,
+        "temperature": "72°F",
+        "condition": "sunny",
+        "humidity": "45%"
+    }
+
+# Create the tool definition in OpenAI function calling format
+weather_tool = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "The city and state, e.g. San Francisco, CA"
+                }
+            },
+            "required": ["location"]
+        }
+    }
+}
+
 # Example: instantiate your BrainProxy class
+# Create BrainProxy instance
 brain_proxy = BrainProxy(
+    tools=[weather_tool],
     # Models in litellm format: "{provider}/{model_name}"
     default_model="openai/gpt-4o-mini",
     memory_model="openai/gpt-4o-mini",
@@ -49,6 +81,9 @@ brain_proxy = BrainProxy(
     upstash_rest_token=os.getenv("UPSTASH_REST_TOKEN"),  # Get this from Upstash dashboard
 )
 
+# Add tool implementation to BrainProxy instance
+brain_proxy.get_weather = get_weather
+
 app.include_router(brain_proxy.router, prefix="/v1")    
 
 @app.get("/")
@@ -64,4 +99,5 @@ def root():
             "embedding": brain_proxy.embedding_model
         },
         "system_prompt": brain_proxy.system_prompt,
+        "available_tools": brain_proxy.get_tools_schema()
     }

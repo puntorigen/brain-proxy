@@ -9,7 +9,7 @@ import asyncio, base64, hashlib, json, time, re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, Union
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -175,7 +175,9 @@ class BrainProxy:
         vector_store_factory: Callable[[str, Any, int], ChromaAsyncWrapper | UpstashVectorStore] = default_vector_store_factory,
         # memory settings
         enable_memory: bool = True,
-        memory_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-35-turbo"
+        memory_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-35-turbo",
+        # tools settings
+        tools: Optional[List[Dict[str, Any]]] = None,
         embedding_model: str = "openai/text-embedding-3-small",  # litellm format e.g. "azure/ada-002"
         mem_top_k: int = 6,
         mem_working_max: int = 12,
@@ -201,6 +203,7 @@ class BrainProxy:
         self.storage_dir = Path(storage_dir)
         self.embedding_model = embedding_model
         self.enable_memory = enable_memory
+        self.tools = tools
         self.memory_model = memory_model
         self.mem_top_k = mem_top_k
         self.mem_working_max = mem_working_max
@@ -618,18 +621,101 @@ class BrainProxy:
     # Upstream dispatch
     # ----------------------------------------------------------------
     async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None):
-        """Dispatch to litellm API"""
+        """Dispatch to litellm API with tools support"""
         kwargs = {
             "model": model,
             "messages": msgs,
             "stream": stream
         }
         
-        # Add tools to kwargs if they are provided in the request
+        # Combine server-defined tools with request tools if any
+        final_tools = []
+        if self.tools:
+            final_tools.extend(self.tools)
         if tools:
-            kwargs["tools"] = tools
+            final_tools.extend(tools)
             
-        return await acompletion(**kwargs)
+        if final_tools:
+            kwargs["tools"] = final_tools
+            kwargs["tool_choice"] = "auto"  # Let the model decide when to use tools
+            
+        response = await acompletion(**kwargs)
+        
+        # Process tool calls if present
+        if not stream and hasattr(response.choices[0], "message") and hasattr(response.choices[0].message, "tool_calls") and response.choices[0].message.tool_calls:
+            tool_calls = response.choices[0].message.tool_calls
+            available_tools = {t["function"]["name"]: t["function"] for t in final_tools}
+            
+            # Execute each tool call
+            tool_results = []
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                if function_name in available_tools:
+                    try:
+                        # Execute the tool and get result
+                        function_args = json.loads(tool_call.function.arguments)
+                        tool_result = await self._execute_tool(function_name, function_args)
+                        tool_results.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": function_name,
+                            "content": str(tool_result)
+                        })
+                    except Exception as e:
+                        tool_results.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": function_name,
+                            "content": f"Error executing tool: {str(e)}"
+                        })
+            
+            # If we have tool results, make a follow-up call with the results
+            if tool_results:
+                # Add tool results to messages
+                new_msgs = msgs + [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments
+                                }
+                            } for tc in tool_calls
+                        ]
+                    },
+                    *tool_results  # Tool results
+                ]
+                
+                # Make follow-up call without tools to get final response
+                kwargs["messages"] = new_msgs
+                kwargs.pop("tools", None)  # Remove tools to prevent infinite loops
+                kwargs.pop("tool_choice", None)
+                response = await acompletion(**kwargs)
+                
+        return response
+        
+    async def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> Any:
+        """Execute a tool and return its result"""
+        # Find the tool definition
+        tool_def = None
+        all_tools = self.tools or []
+        if tool_def := next((t for t in all_tools if t["function"]["name"] == tool_name), None):
+            if hasattr(self, tool_name):
+                # Execute tool method if it exists on the class
+                method = getattr(self, tool_name)
+                if asyncio.iscoroutinefunction(method):
+                    return await method(**tool_args)
+                return method(**tool_args)
+            raise ValueError(f"Tool {tool_name} is defined but not implemented")
+        raise ValueError(f"Tool {tool_name} not found")
+        
+    def get_tools_schema(self) -> List[Dict[str, Any]]:
+        """Return the JSON schema for available tools"""
+        return self.tools or []
 
     # ----------------------------------------------------------------
     # FastAPI route
