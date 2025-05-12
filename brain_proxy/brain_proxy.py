@@ -179,6 +179,7 @@ class BrainProxy:
         embedding_model: str = "openai/text-embedding-3-small",  # litellm format e.g. "azure/ada-002"
         mem_top_k: int = 6,
         mem_working_max: int = 12,
+        enable_global_memory: bool = False, # enables _global tenant access from all tenants
         # misc
         default_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-4"
         storage_dir: str | Path = "tenants",
@@ -203,6 +204,7 @@ class BrainProxy:
         self.memory_model = memory_model
         self.mem_top_k = mem_top_k
         self.mem_working_max = mem_working_max
+        self.enable_global_memory = enable_global_memory
         self.default_model = default_model
         self.extract_text = extract_text or (
             lambda p, m: p.read_text("utf-8", "ignore")
@@ -322,14 +324,16 @@ class BrainProxy:
             self._log(f"No memory manager found for tenant {tenant}")
             return ""
 
-        # Get global memories
-        global_mgr, global_search, _ = self._get_mem_manager('_global')
-
         # 1️⃣  broad search in parallel
         raw: List[str] = []
         search_tasks = [search(user_text, k=self.mem_top_k * 3)]
-        if global_mgr:
-            search_tasks.append(global_search(user_text, k=self.mem_top_k * 3))
+
+        # Get global memories
+        if self.enable_global_memory:
+            global_mgr, global_search, _ = self._get_mem_manager('_global')
+
+            if global_mgr:
+                search_tasks.append(global_search(user_text, k=self.mem_top_k * 3))
         
         # Gather results from all searches
         results = await asyncio.gather(*search_tasks)
