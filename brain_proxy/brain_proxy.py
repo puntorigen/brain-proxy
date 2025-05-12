@@ -366,7 +366,7 @@ class BrainProxy:
             for mem in raw:
                 # we stored ISO timestamps in the memory doc’s metadata and also
                 # prefixed them in text like “[2025-06-20T14:03:00+00:00] …”
-                m = re.match(r"\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]", mem)
+                m = re.match(r"\[(\d{4}-\d{2}-\d{2}T[^]]+)\]", mem)
                 ts = m.group(1) if m else ""
                 if ts and start.isoformat() <= ts <= end.isoformat():
                     filtered.append(mem)
@@ -374,7 +374,15 @@ class BrainProxy:
         else:
             memories = raw
 
-        return "\\n".join(memories[: self.mem_top_k])
+        # Sort memories by timestamp (oldest first) if they have timestamps
+        def extract_timestamp(memory):
+            m = re.match(r"\[(\d{4}-\d{2}-\d{2}T[^]]+)\]", memory)
+            return m.group(1) if m else "0" # Default to oldest if no timestamp
+
+        memories.sort(key=extract_timestamp)  # Oldest first
+        # Take the last k memories (most recent ones)
+        memories = memories[-self.mem_top_k:]
+        return "\\n".join(memories)  # Return the last k memories
 
     async def _write_memories(
         self, tenant: str, conversation: List[Dict[str, Any]]
