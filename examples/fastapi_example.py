@@ -12,7 +12,8 @@ Required environment variables:
 
 from fastapi import FastAPI
 # Adjust the import path below if brain_proxy is not installed as a package
-from brain_proxy import BrainProxy #, ask, chat, index_file, add_memory
+from brain_proxy import BrainProxy
+from brain_proxy.tools import tool
 import dotenv, os
 # TODO create: ask,chat methods (compatible with langchain), index_file, add_memory (args: tenant, data)
 # TODO create method for erasing timespan memory/history with tenant (args: tenant, timespan)
@@ -28,9 +29,17 @@ SYSTEM_PROMPT = "You are Claude, a friendly and helpful AI assistant. You are co
 
 app = FastAPI()
 
-# Define a dummy weather tool
+# Define tools using the decorator
+@tool(description="Get the current weather for a location")
 async def get_weather(location: str) -> dict:
-    """Dummy weather implementation that always returns sunny and 72°F"""
+    """Get the current weather conditions for a specific location.
+    
+    Args:
+        location: The city and state, e.g. San Francisco, CA
+    
+    Returns:
+        dict: Weather information including temperature, condition and humidity
+    """
     print("get_weather called with location:", location)
     return {
         "location": location,
@@ -39,29 +48,8 @@ async def get_weather(location: str) -> dict:
         "humidity": "45%"
     }
 
-# Create the tool definition in OpenAI function calling format
-weather_tool = {
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": "Get the current weather for a location",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "location": {
-                    "type": "string",
-                    "description": "The city and state, e.g. San Francisco, CA"
-                }
-            },
-            "required": ["location"]
-        }
-    }
-}
-
-# Example: instantiate your BrainProxy class
-# Create BrainProxy instance
+# Example: instantiate your BrainProxy class with automatic tool registration
 brain_proxy = BrainProxy(
-    tools=[weather_tool],
     # Models in litellm format: "{provider}/{model_name}"
     default_model="openai/gpt-4o-mini",
     memory_model="openai/gpt-4o-mini",
@@ -81,10 +69,7 @@ brain_proxy = BrainProxy(
     upstash_rest_token=os.getenv("UPSTASH_REST_TOKEN"),  # Get this from Upstash dashboard
 )
 
-# Add tool implementation to BrainProxy instance
-brain_proxy.get_weather = get_weather
-
-app.include_router(brain_proxy.router, prefix="/v1")    
+app.include_router(brain_proxy.router, prefix="/v1")
 
 @app.get("/")
 def root():

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, Union
+from .tools import get_registry
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -178,6 +179,7 @@ class BrainProxy:
         memory_model: str = "openai/gpt-4o-mini",  # litellm format e.g. "azure/gpt-35-turbo",
         # tools settings
         tools: Optional[List[Dict[str, Any]]] = None,
+        use_registry_tools: bool = True,
         embedding_model: str = "openai/text-embedding-3-small",  # litellm format e.g. "azure/ada-002"
         mem_top_k: int = 6,
         mem_working_max: int = 12,
@@ -201,14 +203,27 @@ class BrainProxy:
     ):
         # Initialize basic attributes first
         self.storage_dir = Path(storage_dir)
-        self.embedding_model = embedding_model
+        self.memory_model = memory_model
         self.enable_memory = enable_memory
-        self.tools = tools
+        
+        # Initialize tools
+        self.tools = []
+        if use_registry_tools:
+            registry = get_registry()
+            self.tools.extend(registry.get_tools())
+            # Add implementations to instance
+            for tool_def in registry.get_tools():
+                name = tool_def["function"]["name"]
+                if impl := registry.get_implementation(name):
+                    setattr(self, name, impl)
+        if tools:
+            self.tools.extend(tools)
         self.memory_model = memory_model
         self.mem_top_k = mem_top_k
         self.mem_working_max = mem_working_max
         self.enable_global_memory = enable_global_memory
         self.default_model = default_model
+        self.embedding_model = embedding_model
         self.extract_text = extract_text or (
             lambda p, m: p.read_text("utf-8", "ignore")
         )
@@ -700,18 +715,21 @@ class BrainProxy:
         
     async def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> Any:
         """Execute a tool and return its result"""
-        # Find the tool definition
-        tool_def = None
-        all_tools = self.tools or []
-        if tool_def := next((t for t in all_tools if t["function"]["name"] == tool_name), None):
-            if hasattr(self, tool_name):
-                # Execute tool method if it exists on the class
-                method = getattr(self, tool_name)
-                if asyncio.iscoroutinefunction(method):
-                    return await method(**tool_args)
-                return method(**tool_args)
-            raise ValueError(f"Tool {tool_name} is defined but not implemented")
-        raise ValueError(f"Tool {tool_name} not found")
+        # First check registry
+        registry = get_registry()
+        if impl := registry.get_implementation(tool_name):
+            if asyncio.iscoroutinefunction(impl):
+                return await impl(**tool_args)
+            return impl(**tool_args)
+            
+        # Then check instance methods
+        if hasattr(self, tool_name):
+            method = getattr(self, tool_name)
+            if asyncio.iscoroutinefunction(method):
+                return await method(**tool_args)
+            return method(**tool_args)
+            
+        raise ValueError(f"Tool {tool_name} not found or not implemented")
         
     def get_tools_schema(self) -> List[Dict[str, Any]]:
         """Return the JSON schema for available tools"""
