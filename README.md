@@ -42,6 +42,7 @@ proxy = BrainProxy(
     enable_memory=True,  # Enable/disable memory features (default True)
     debug=False,  # Enable detailed debug logging when needed
     storage_dir="tenants",  # Default base directory for tenant data
+    enable_global_memory=False,  # Enable access to _global tenant from all tenants
 )
 
 app = FastAPI()
@@ -71,6 +72,7 @@ BrainProxy(
     embedding_model="openai/text-embedding-3-small",  # Model for embeddings (litellm format)
     mem_top_k=6,  # Maximum number of memories to retrieve per query
     mem_working_max=12,  # Maximum memories to keep in working memory
+    enable_global_memory=False,  # Enable access to _global tenant from all tenants
     
     # Storage settings
     storage_dir="tenants",  # Base directory for tenant data
@@ -670,84 +672,101 @@ Files are saved in tenant-specific directories, parsed, embedded, and used in RA
 
 ## 🛠️ Tools Support
 
-The `/chat/completions` endpoint supports OpenAI-compatible function calling and tools:
+brain-proxy now includes a powerful tool system that makes it easy to add custom functionality to your AI assistant. Tools can be defined using a simple decorator:
 
-```json
-{
-  "model": "openai/gpt-4o-mini",
-  "messages": [{"role": "user", "content": "What's the weather like?"}],
-  "tools": [
-    {
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get the current weather",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "location": {
-              "type": "string",
-              "description": "The location to get weather for"
-            }
-          },
-          "required": ["location"]
-        }
-      }
+```python
+from brain_proxy import tool
+
+@tool(description="Get the current weather for a location")
+async def get_weather(location: str) -> dict:
+    """Get current weather conditions.
+    
+    Args:
+        location: The city and state, e.g. San Francisco, CA
+    
+    Returns:
+        dict: Weather information including temperature and conditions
+    """
+    return {
+        "temperature": "72°F",
+        "condition": "sunny"
     }
-  ],
-  "tool_choice": "auto"
-}
+
+# Tools are automatically registered with BrainProxy
+proxy = BrainProxy()
 ```
 
-The response will include tool calls in the standard OpenAI format:
+The tool system features:
+- Automatic parameter schema generation from type hints and docstrings
+- Support for both sync and async functions
+- Global tool registry for easy reuse
+- Compatible with OpenAI function calling format
 
-```json
-{
-  "id": "...",
-  "choices": [{
-    "message": {
-      "role": "assistant",
-      "content": null,
-      "tool_calls": [{
-        "id": "call_xyz",
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "arguments": "{\"location\": \"New York\"}"
-        }
-      }]
-    }
-  }]
-}
+You can also disable automatic tool registration if needed:
+```python
+proxy = BrainProxy(use_registry_tools=False)
 ```
 
-You can then send the tool outputs back in your next message:
+## 📑 Custom Document Processing
 
-```json
-{
-  "model": "openai/gpt-4o-mini",
-  "messages": [
-    {"role": "user", "content": "What's the weather like?"},
-    {
-      "role": "assistant",
-      "content": null,
-      "tool_calls": [{
-        "id": "call_xyz",
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "arguments": "{\"location\": \"New York\"}"
-        }
-      }]
-    },
-    {
-      "role": "tool",
-      "content": "{\"temperature\": 72, \"conditions\": \"sunny\"}",
-      "tool_call_id": "call_xyz"
-    }
-  ]
-}
+The `extract_text` function now supports returning either a string or a list of LangChain `Document` objects:
+
+```python
+from langchain.schema import Document
+
+def process_document(path: Path, mime_type: str) -> str | List[Document]:
+    """Custom document processor that can return string or Documents"""
+    if mime_type == "application/pdf":
+        # Return a list of Documents with metadata
+        return [
+            Document(
+                page_content="Page 1 content...",
+                metadata={"page": 1, "source": path.name}
+            ),
+            Document(
+                page_content="Page 2 content...",
+                metadata={"page": 2, "source": path.name}
+            )
+        ]
+    else:
+        # Return simple string for other formats
+        return "Extracted text content..."
+
+proxy = BrainProxy(extract_text=process_document)
 ```
+
+## 🌐 Global Memory
+
+Enable shared memory across all tenants with the `enable_global_memory` flag:
+
+```python
+proxy = BrainProxy(
+    enable_global_memory=True  # Allows all tenants to access _global memories
+)
+```
+
+When enabled:
+- Any tenant can read from the `_global` tenant's memory
+- Useful for shared knowledge bases or company-wide information
+- Individual tenant memories remain private
+
+## ⚡ Vector Store Improvements
+
+The Upstash vector store adapter now uses LangChain's native Upstash integration for better performance and reliability:
+
+```python
+proxy = BrainProxy(
+    # Upstash configuration (uses LangChain integration)
+    upstash_rest_url="https://your-instance.upstash.io",
+    upstash_rest_token="your-token"
+)
+```
+
+Benefits:
+- Improved query performance
+- Better connection handling
+- Native LangChain compatibility
+- Simplified configuration
 
 ---
 
@@ -757,12 +776,11 @@ You can then send the tool outputs back in your next message:
 from pdfminer.high_level import extract_text
 
 def parse_pdf(path: Path, mime: str) -> str:
+    """Custom PDF extractor"""
     if mime == "application/pdf":
         return extract_text(path)
     return "(unsupported format)"
-```
 
-```python
 proxy = BrainProxy(
     default_model="openai/gpt-4o-mini",
     extract_text=parse_pdf
