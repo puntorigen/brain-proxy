@@ -25,7 +25,7 @@ setup(
         "dateparser",
         "async-promptic",
         "httpx",
-        "upstash_vector"  # Add Upstash Vector dependency
+        "upstash-vector"  # Add Upstash Vector dependency
     ],
     include_package_data=True,
 )

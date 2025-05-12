@@ -43,6 +43,10 @@ brain_proxy = BrainProxy(
     temporal_awareness=True,
     # TODO: external=False, # only allows internal access (ask,chat,etc)
     debug=DEBUG_MODE,
+    max_workers=5,
+    # Upstash configuration
+    upstash_rest_url=os.getenv("UPSTASH_REST_URL"),  # Get this from Upstash dashboard
+    upstash_rest_token=os.getenv("UPSTASH_REST_TOKEN"),  # Get this from Upstash dashboard
 )
 
 app.include_router(brain_proxy.router, prefix="/v1")    

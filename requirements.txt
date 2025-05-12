@@ -5,3 +5,4 @@ langmem
 tiktoken
 pydantic
 langchain-openai
+upstash-vector
