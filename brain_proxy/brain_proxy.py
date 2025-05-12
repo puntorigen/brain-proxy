@@ -331,14 +331,13 @@ class BrainProxy:
         # Get global memories
         global_mgr, global_search, _ = self._get_mem_manager('_global')
 
-        if self.enable_global_memory:
-            if global_mgr:
-                search_tasks.append(global_search(user_text, k=self.mem_top_k * 3))
+        if self.enable_global_memory and global_mgr:
+            search_tasks.append(global_search(user_text, k=self.mem_top_k * 3))
         
         # Gather results from all searches
         results = await asyncio.gather(*search_tasks)
         raw.extend(results[0])  # Tenant-specific memories
-        if global_mgr:
+        if self.enable_global_memory and global_mgr:
             raw.extend(results[1])  # Global memories
 
         # 2️⃣  try to detect a date / relative phrase
