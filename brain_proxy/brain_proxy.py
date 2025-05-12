@@ -329,9 +329,9 @@ class BrainProxy:
         search_tasks = [search(user_text, k=self.mem_top_k * 3)]
 
         # Get global memories
-        if self.enable_global_memory:
-            global_mgr, global_search, _ = self._get_mem_manager('_global')
+        global_mgr, global_search, _ = self._get_mem_manager('_global')
 
+        if self.enable_global_memory:
             if global_mgr:
                 search_tasks.append(global_search(user_text, k=self.mem_top_k * 3))
         
