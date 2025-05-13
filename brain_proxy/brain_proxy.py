@@ -192,6 +192,7 @@ class BrainProxy:
         # auth hooks
         auth_hook: Optional[Callable[[Request, str], Any]] = None,
         usage_hook: Optional[Callable[[str, int, float], Any]] = None,
+        local_tools_handler: Optional[Callable[[Request, str], Any]] = None,
         max_upload_mb: int = 20,
         temporal_awareness: bool = True, # enable temporal awareness (time tracking of knowledge)
         system_prompt: Optional[str] = None,
@@ -230,8 +231,10 @@ class BrainProxy:
         self.manager_fn = manager_fn
         self.auth_hook = auth_hook
         self.usage_hook = usage_hook
+        self.local_tools_handler = local_tools_handler
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self._mem_managers: Dict[str, Any] = {}
+        self._tenant_tools: Dict[str, Any] = {}
         self.temporal_awareness = temporal_awareness
         self.system_prompt = system_prompt
         self.debug = debug
@@ -643,7 +646,7 @@ class BrainProxy:
     # ----------------------------------------------------------------
     # Upstream dispatch
     # ----------------------------------------------------------------
-    async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None):
+    async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None, tenant: Optional[str] = None):
         """Dispatch to litellm API with tools support"""
         kwargs = {
             "model": model,
@@ -653,11 +656,16 @@ class BrainProxy:
         
         # Combine server-defined tools with request tools if any
         final_tools = []
+        local_tools = []
         if self.tools:
             final_tools.extend(self.tools)
-        if tools:
+        if tools: # tools specified in request (should be handled by self.local_tools_handler instead of _execute_tool)
             final_tools.extend(tools)
-            
+            local_tools.extend(tools)
+        if tenant in self._tenant_tools:
+            final_tools.extend(self._tenant_tools[tenant])
+            local_tools.extend(self._tenant_tools[tenant])
+        
         if final_tools:
             kwargs["tools"] = final_tools
             kwargs["tool_choice"] = "auto"  # Let the model decide when to use tools
@@ -668,12 +676,38 @@ class BrainProxy:
         if not stream and hasattr(response.choices[0], "message") and hasattr(response.choices[0].message, "tool_calls") and response.choices[0].message.tool_calls:
             tool_calls = response.choices[0].message.tool_calls
             available_tools = {t["function"]["name"]: t["function"] for t in final_tools}
-            
+            local_tools = {t["function"]["name"]: t["function"] for t in local_tools}
+                
             # Execute each tool call
             tool_results = []
             for tool_call in tool_calls:
                 function_name = tool_call.function.name
-                if function_name in available_tools:
+                # first try to execute local tool if in there
+                local_tool_failed = False
+                if function_name in local_tools:
+                    try:
+                        # Execute the tool with the self.local_tools_handler and get result
+                        function_args = json.loads(tool_call.function.arguments)
+                        tool_result = await self.local_tools_handler(function_name, function_args)
+                        tool_results.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": function_name,
+                            "content": str(tool_result)
+                        })
+                    except Exception as e:
+                        # if local tool fails, try to execute server tool
+                        self._log(f"Error executing local tool {function_name}: {str(e)}")
+                        self._log(f"(fallback) Attempting to execute it as a server tool {function_name}")
+                        tool_results.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": function_name,
+                            "content": f"Error executing tool: {str(e)}"
+                        })
+                        local_tool_failed = True
+                
+                if function_name in available_tools and not local_tool_failed:
                     try:
                         # Execute the tool and get result
                         function_args = json.loads(tool_call.function.arguments)
@@ -747,6 +781,24 @@ class BrainProxy:
     # FastAPI route
     # ----------------------------------------------------------------
     def _mount(self):
+        @self.router.post("/{tenant}/tools")
+        async def set_tools(request: Request, tenant: str):
+            # Special handling auth
+            if self.auth_hook:
+                await _maybe(self.auth_hook, request, tenant)
+
+            body = await request.json()
+            if not isinstance(body, list):
+                raise HTTPException(status_code=400, detail="Expected array of tools")
+                
+            # Validate each tool has required fields
+            for tool in body:
+                if not isinstance(tool, dict) or 'type' not in tool or 'function' not in tool:
+                    raise HTTPException(status_code=400, detail="Invalid tool schema")
+            
+            self._tenant_tools[tenant] = body
+            return {"status": "success", "count": len(body)}
+
         @self.router.post("/{tenant}/chat/completions")
         async def chat(request: Request, tenant: str):
             # Special handling auth
@@ -812,7 +864,8 @@ class BrainProxy:
                 msgs, 
                 req.model or self.default_model, 
                 stream=req.stream,
-                tools=req.tools
+                tools=req.tools,
+                tenant=tenant
             )
             t0 = time.time()
 
