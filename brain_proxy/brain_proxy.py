@@ -688,7 +688,7 @@ class BrainProxy:
                     try:
                         # Execute the tool with the self.local_tools_handler and get result
                         function_args = json.loads(tool_call.function.arguments)
-                        tool_result = await self.local_tools_handler(function_name, function_args)
+                        tool_result = await self.local_tools_handler(tenant, function_name, function_args)
                         tool_results.append({
                             "tool_call_id": tool_call.id,
                             "role": "tool",
