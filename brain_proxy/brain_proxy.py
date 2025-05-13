@@ -898,26 +898,148 @@ class BrainProxy:
             async def event_stream() -> AsyncIterator[str]:
                 tokens = 0
                 buf: List[str] = []
+                tool_calls = []
+                tool_detected = False
+                collected_chunks = []
+
                 async for chunk in upstream_iter:
-                    payload = json.loads(chunk.model_dump_json())
-                    delta = payload["choices"][0].get("delta", {}).get("content", "")
-                    if delta is None:
-                        delta = ""
-                    tokens += len(delta)
-                    buf.append(delta)
+                    try:
+                        payload = json.loads(chunk.model_dump_json())
+                    except:
+                        payload = chunk
+                    choice = payload["choices"][0]
+                    delta = choice.get("delta", {})
+
+                    # Recolectar chunks para posible reuso
+                    collected_chunks.append(payload)
+
+                    # Detectar tool_calls
+                    tool_data = delta.get("tool_calls", None)
+                    if isinstance(tool_data, list):
+                        tool_calls.extend(tool_data)
+                        tool_detected = True
+                        break
+
+                    content = delta.get("content", "")
+                    if content:
+                        buf.append(content)
+                        tokens += len(content)
+
                     yield f"data: {json.dumps(payload)}\n\n"
-                yield "data: [DONE]\n\n"
-                await self._write_memories(
-                    tenant, 
-                    msgs 
-                    + [
+
+                # Si se detectaron herramientas, ejecutar y reanudar stream
+                if tool_detected:
+                    # Emitir chunks recolectados antes del corte
+                    for payload in collected_chunks:
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+                    # Preparar tools disponibles
+                    final_tools = []
+                    local_tools_list = []
+                    if self.tools:
+                        final_tools.extend(self.tools)
+                    if req.tools:
+                        final_tools.extend(req.tools)
+                        local_tools_list.extend(req.tools)
+                    if tenant in self._tenant_tools:
+                        final_tools.extend(self._tenant_tools[tenant])
+                        local_tools_list.extend(self._tenant_tools[tenant])
+
+                    available_tools = {t["function"]["name"]: t["function"] for t in final_tools}
+                    local_tools = {t["function"]["name"]: t["function"] for t in local_tools_list}
+
+                    tool_results = []
+                    for tool_call in tool_calls:
+                        name = tool_call["function"]["name"]
+                        args_str = tool_call["function"].get("arguments", "")
+                        if not args_str or not args_str.strip():
+                            self._log(f"⚠️ Tool {tool_call['function']['name']} called with empty arguments.")
+                            args = {}
+                        else:
+                            try:
+                                self._log(f"Tool call arguments for {tool_call['function']['name']}: {repr(tool_call['function'].get('arguments'))}")
+                                args = json.loads(args_str)
+                            except json.JSONDecodeError as e:
+                                self._log(f"❌ Failed to parse arguments for tool {tool_call['function']['name']}: {e}")
+                                args = {}
+
+                        local_tool_failed = False
+
+                        if name in local_tools:
+                            try:
+                                result = await self.local_tools_handler(tenant, name, args)
+                                tool_results.append({
+                                    "tool_call_id": tool_call["id"],
+                                    "role": "tool",
+                                    "name": name,
+                                    "content": str(result),
+                                })
+                                continue
+                            except Exception as e:
+                                self._log(f"Error executing local tool {name}: {e}")
+                                tool_results.append({
+                                    "tool_call_id": tool_call["id"],
+                                    "role": "tool",
+                                    "name": name,
+                                    "content": f"Error executing local tool: {str(e)}",
+                                })
+                                local_tool_failed = True
+
+                        if name in available_tools and not local_tool_failed:
+                            try:
+                                result = await self._execute_tool(name, args)
+                                tool_results.append({
+                                    "tool_call_id": tool_call["id"],
+                                    "role": "tool",
+                                    "name": name,
+                                    "content": str(result),
+                                })
+                            except Exception as e:
+                                self._log(f"Error executing server tool {name}: {e}")
+                                tool_results.append({
+                                    "tool_call_id": tool_call["id"],
+                                    "role": "tool",
+                                    "name": name,
+                                    "content": f"Error executing tool: {str(e)}",
+                                })
+
+                    # Segunda llamada con respuestas de los tools
+                    followup_msgs = msgs + [
                         {
-                            "role": "assistant", 
-                            "content": self._maybe_prefix("".join(buf)),
-                            "timestamp": datetime.now(timezone.utc).isoformat()
-                        }
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": tool_calls,
+                        },
+                        *tool_results,
                     ]
+
+                    followup_kwargs = {
+                        "model": req.model or self.default_model,
+                        "messages": followup_msgs,
+                        "stream": True,
+                    }
+
+                    followup_iter = await acompletion(**followup_kwargs)
+
+                    async for chunk in followup_iter:
+                        payload = json.loads(chunk.model_dump_json())
+                        delta = payload["choices"][0].get("delta", {}).get("content", "")
+                        if delta:
+                            buf.append(delta)
+                            tokens += len(delta)
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+                yield "data: [DONE]\n\n"
+
+                await self._write_memories(
+                    tenant,
+                    msgs + [{
+                        "role": "assistant",
+                        "content": self._maybe_prefix("".join(buf)),
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    }]
                 )
+
                 if self.usage_hook:
                     await _maybe(self.usage_hook, tenant, tokens, time.time() - t0)
 
