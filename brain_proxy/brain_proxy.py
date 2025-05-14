@@ -26,6 +26,8 @@ from langchain_litellm import ChatLiteLLM
 from .temporal_utils import extract_timerange
 from .upstash_adapter import upstash_vec_factory
 from .chroma_adapter import chroma_vec_factory
+#import litellm
+#litellm._turn_on_debug()
 
 # For creating proper Memory objects
 class Memory(BaseModel):
@@ -33,6 +35,48 @@ class Memory(BaseModel):
 
 # LangMem primitives (functions, not classes)
 from langmem import create_memory_manager
+
+_MEMORY_INSTRUCTIONS = """
+You are a long-term memory manager that maintains semantic, procedural, and episodic memories
+for a life-long learning agent.
+
+--------------------------------------------------------------------------------
+0. ⛔️  FILTER  ⛔️
+Before doing anything else, IGNORE and DO NOT STORE:
+  • Transient errors, one-off failures, “I don't have access to X”, or logging noise.
+  • Ephemeral operational states of the system (latency, rate limits, debug traces).
+  • Polite fillers, apologies, or meta-comments that do not change future behaviour.
+  • Messages that merely repeat existing memories without adding new facts.
+
+--------------------------------------------------------------------------------
+1. 📥  EXTRACT & CONTEXTUALISE
+  • Capture stable facts, user preferences, goals, constraints, and relationships.
+  • When uncertain, tag with a confidence score (p(x)=…).
+  • Quote supporting snippets only when strictly necessary.
+
+--------------------------------------------------------------------------------
+2. 🔄  COMPARE & UPDATE
+  • Detect novelty vs existing store; merge or supersede as needed.
+  • Compress or discard redundant memories to keep the store dense.
+  • Remove information proven false or obsolete.
+
+--------------------------------------------------------------------------------
+3. 🧠  SYNTHESISE & REASON
+  • Infer patterns, habits, or higher-level rules that will guide future actions.
+  • Generalise when possible and annotate with probabilistic confidence.
+
+--------------------------------------------------------------------------------
+4. 📝  WRITE
+Store each memory exactly as you would like to recall it when deciding how to act.
+Prioritise:
+  • Surprising deviations from prior patterns.
+  • Persistent facts repeatedly reinforced.
+  • Information that will affect long-term strategy or user satisfaction.
+
+Do **NOT** store anything that violates step 0.  Favour dense, declarative sentences
+over raw chat fragments.  Use the agent’s first-person voice when relevant (“I…”).
+"""
+
 
 # -------------------------------------------------------------------
 # Pydantic schemas (OpenAI spec + file‑data part)
@@ -192,7 +236,7 @@ class BrainProxy:
         # auth hooks
         auth_hook: Optional[Callable[[Request, str], Any]] = None,
         usage_hook: Optional[Callable[[str, int, float], Any]] = None,
-        local_tools_handler: Optional[Callable[[Request, str], Any]] = None,
+        local_tools_handler: Optional[Callable[[str, str, Dict[str, Any]], Any]] = None,
         max_upload_mb: int = 20,
         temporal_awareness: bool = True, # enable temporal awareness (time tracking of knowledge)
         system_prompt: Optional[str] = None,
@@ -328,7 +372,7 @@ class BrainProxy:
 
         # Use langchain_litellm's ChatLiteLLM for memory manager directly
         # No wrapper to avoid potential deadlocks
-        manager = create_memory_manager(ChatLiteLLM(model=self.memory_model))
+        manager = create_memory_manager(ChatLiteLLM(model=self.memory_model), instructions=_MEMORY_INSTRUCTIONS)
         
         self._mem_managers[tenant] = (manager, _search_mem, _store_mem)
         return self._mem_managers[tenant]
@@ -646,6 +690,34 @@ class BrainProxy:
     # ----------------------------------------------------------------
     # Upstream dispatch
     # ----------------------------------------------------------------
+    def _validate_messages(self, messages):
+        """
+        Ensure messages conform to OpenAI's requirements for tool messages:
+        - Each 'tool' message must be a response to a preceding assistant message with 'tool_calls'
+        - Each 'tool' message must have a 'tool_call_id' that matches one in the assistant's 'tool_calls'
+        """
+        valid_msgs = []
+        tool_call_ids = set()  # Track valid tool_call_ids from assistant messages
+        
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                # Keep all assistant messages
+                valid_msgs.append(msg)
+                # If this assistant has tool_calls, add their IDs to our tracking set
+                if msg.get("tool_calls"):
+                    for tc in msg.get("tool_calls", []):
+                        if tc.get("id"):
+                            tool_call_ids.add(tc.get("id"))
+            elif msg.get("role") == "tool":
+                # Only keep tool messages that have a valid tool_call_id
+                if msg.get("tool_call_id") in tool_call_ids:
+                    valid_msgs.append(msg)
+            else:
+                # Keep all other messages (user, system, etc.)
+                valid_msgs.append(msg)
+        
+        return valid_msgs
+
     async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None, tenant: Optional[str] = None):
         """Dispatch to litellm API with tools support"""
         kwargs = {
@@ -666,10 +738,19 @@ class BrainProxy:
             final_tools.extend(self._tenant_tools[tenant])
             local_tools.extend(self._tenant_tools[tenant])
         
+        by_name = {}
+        for tool in final_tools:
+            by_name[tool['function']['name']] = tool
+        final_tools = list(by_name.values())
         if final_tools:
+            self._log(f"➡️  Enviando {len(final_tools)} tools: {[t['function']['name'] for t in final_tools]}")
             kwargs["tools"] = final_tools
             kwargs["tool_choice"] = "auto"  # Let the model decide when to use tools
-            
+                    
+        msgs = self._validate_messages(msgs)
+
+        kwargs["messages"] = msgs
+        self._log(f"➡️  Enviando kwargs: {kwargs}")
         response = await acompletion(**kwargs)
         
         # Process tool calls if present
@@ -729,7 +810,7 @@ class BrainProxy:
             # If we have tool results, make a follow-up call with the results
             if tool_results:
                 # Add tool results to messages
-                new_msgs = msgs + [
+                new_msgs = self._prune_msgs_for_tool_followup(msgs) + [
                     {
                         "role": "assistant",
                         "content": None,
@@ -776,6 +857,22 @@ class BrainProxy:
     def get_tools_schema(self) -> List[Dict[str, Any]]:
         """Return the JSON schema for available tools"""
         return self.tools or []
+        
+    def _prune_msgs_for_tool_followup(self, msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remueve cualquier bloque tool/tool_calls anteriores para dejar lista la secuencia."""
+        pruned = list(msgs)
+
+        # Recorre hacia atrás buscando el último bloque tool_call + tools
+        for i in range(len(pruned) - 1, -1, -1):
+            msg = pruned[i]
+            if msg["role"] == "tool":
+                # Si no hay un tool_calls justo antes, este tool es inválido
+                if i == 0 or pruned[i - 1].get("tool_calls") is None:
+                    pruned.pop(i)
+            elif msg.get("tool_calls"):
+                # Si encontramos un bloque de tool_calls seguido de tools, eliminamos ese bloque completo
+                return pruned[:i]
+        return pruned
 
     # ----------------------------------------------------------------
     # FastAPI route
@@ -859,6 +956,8 @@ class BrainProxy:
                 self._log(f"Memory disabled for tenant {tenant}")
             
             msgs = await self._rag(msgs, tenant)
+            msgs = self._prune_msgs_for_tool_followup(msgs)
+            original_msgs = list(msgs)  # copia para evitar mutaciones posteriores
 
             upstream_iter = await self._dispatch(
                 msgs, 
@@ -898,147 +997,210 @@ class BrainProxy:
             async def event_stream() -> AsyncIterator[str]:
                 tokens = 0
                 buf: List[str] = []
-                tool_calls = []
-                tool_detected = False
-                collected_chunks = []
+                tool_call_parts: dict[str, dict] = {}
+                tool_calls_detected = False
+
+                def merge_tool_call(base: dict, update: dict) -> dict:
+                    """
+                    Une un delta de tool_call con el estado acumulado.
+                    - 'name' se fija la primera vez que aparezca.
+                    - 'arguments' se van *concatenando* (son fragmentos de una string JSON).
+                    """
+                    result = base.copy()
+
+                    # --- id (no cambia) ---
+                    if update.get("id"):
+                        result["id"] = str(update["id"])
+
+                    # --- function payload ---
+                    upd_fn   = update.get("function", {})
+                    base_fn  = result.get("function", {})
+                    # name sólo si todavía no lo teníamos
+                    if "name" in upd_fn and not base_fn.get("name"):
+                        base_fn["name"] = upd_fn["name"]
+
+                    # concatenar argumentos
+                    if "arguments" in upd_fn:
+                        prev = base_fn.get("arguments", "")
+                        base_fn["arguments"] = f"{prev}{upd_fn['arguments']}"
+
+                    result["function"] = base_fn
+                    return result
 
                 async for chunk in upstream_iter:
                     try:
                         payload = json.loads(chunk.model_dump_json())
-                    except:
+                    except Exception:
                         payload = chunk
+
                     choice = payload["choices"][0]
                     delta = choice.get("delta", {})
+                    self._log(f"RAW CHUNK: {chunk}")
 
-                    # Recolectar chunks para posible reuso
-                    collected_chunks.append(payload)
+                    if "tool_calls" in delta:
+                        self._log(f"TOOL CALLS IN DELTA: {delta['tool_calls']}")
 
-                    # Detectar tool_calls
-                    tool_data = delta.get("tool_calls", None)
-                    if isinstance(tool_data, list):
-                        tool_calls.extend(tool_data)
-                        tool_detected = True
+
+                    # 1️⃣  acumular textos normales
+                    if "content" in delta and delta["content"] is not None:
+                        buf.append(delta["content"])
+                        tokens += len(delta["content"])
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+                    # 2️⃣  acumular tool calls
+                    for tc in (delta.get("tool_calls", []) or []):
+                        tool_calls_detected = True
+                        _id = tc.get("id") or f"call_{len(tool_call_parts)}"
+                        tc["id"] = _id
+                        if _id in tool_call_parts:
+                            tool_call_parts[_id] = merge_tool_call(tool_call_parts[_id], tc)
+                        else:
+                            tool_call_parts[_id] = tc
+
+                        # IMPORTANT: Also yield this delta
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+                    # 3️⃣  ¿termina la llamada a herramientas?
+                    if choice.get("finish_reason") == "tool_calls":
+                        self._log(f"TOOL CALLS FINISHED! Found {len(tool_call_parts)} calls: {tool_call_parts}")
                         break
 
-                    content = delta.get("content", "")
-                    if content:
-                        buf.append(content)
-                        tokens += len(content)
-
-                    yield f"data: {json.dumps(payload)}\n\n"
-
-                # Si se detectaron herramientas, ejecutar y reanudar stream
-                if tool_detected:
-                    # Emitir chunks recolectados antes del corte
-                    for payload in collected_chunks:
-                        yield f"data: {json.dumps(payload)}\n\n"
-
-                    # Preparar tools disponibles
-                    final_tools = []
-                    local_tools_list = []
-                    if self.tools:
-                        final_tools.extend(self.tools)
-                    if req.tools:
-                        final_tools.extend(req.tools)
-                        local_tools_list.extend(req.tools)
-                    if tenant in self._tenant_tools:
-                        final_tools.extend(self._tenant_tools[tenant])
-                        local_tools_list.extend(self._tenant_tools[tenant])
-
-                    available_tools = {t["function"]["name"]: t["function"] for t in final_tools}
-                    local_tools = {t["function"]["name"]: t["function"] for t in local_tools_list}
-
-                    tool_results = []
-                    for tool_call in tool_calls:
-                        name = tool_call["function"]["name"]
-                        args_str = tool_call["function"].get("arguments", "")
-                        if not args_str or not args_str.strip():
-                            self._log(f"⚠️ Tool {tool_call['function']['name']} called with empty arguments.")
-                            args = {}
-                        else:
-                            try:
-                                self._log(f"Tool call arguments for {tool_call['function']['name']}: {repr(tool_call['function'].get('arguments'))}")
-                                args = json.loads(args_str)
-                            except json.JSONDecodeError as e:
-                                self._log(f"❌ Failed to parse arguments for tool {tool_call['function']['name']}: {e}")
-                                args = {}
-
-                        local_tool_failed = False
-
-                        if name in local_tools:
-                            try:
-                                result = await self.local_tools_handler(tenant, name, args)
-                                tool_results.append({
-                                    "tool_call_id": tool_call["id"],
-                                    "role": "tool",
-                                    "name": name,
-                                    "content": str(result),
-                                })
-                                continue
-                            except Exception as e:
-                                self._log(f"Error executing local tool {name}: {e}")
-                                tool_results.append({
-                                    "tool_call_id": tool_call["id"],
-                                    "role": "tool",
-                                    "name": name,
-                                    "content": f"Error executing local tool: {str(e)}",
-                                })
-                                local_tool_failed = True
-
-                        if name in available_tools and not local_tool_failed:
-                            try:
-                                result = await self._execute_tool(name, args)
-                                tool_results.append({
-                                    "tool_call_id": tool_call["id"],
-                                    "role": "tool",
-                                    "name": name,
-                                    "content": str(result),
-                                })
-                            except Exception as e:
-                                self._log(f"Error executing server tool {name}: {e}")
-                                tool_results.append({
-                                    "tool_call_id": tool_call["id"],
-                                    "role": "tool",
-                                    "name": name,
-                                    "content": f"Error executing tool: {str(e)}",
-                                })
-
-                    # Segunda llamada con respuestas de los tools
-                    followup_msgs = msgs + [
-                        {
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": tool_calls,
-                        },
-                        *tool_results,
-                    ]
-
-                    followup_kwargs = {
-                        "model": req.model or self.default_model,
-                        "messages": followup_msgs,
-                        "stream": True,
-                    }
-
-                    followup_iter = await acompletion(**followup_kwargs)
-
-                    async for chunk in followup_iter:
-                        payload = json.loads(chunk.model_dump_json())
-                        delta = payload["choices"][0].get("delta", {}).get("content", "")
-                        if delta:
-                            buf.append(delta)
-                            tokens += len(delta)
-                        yield f"data: {json.dumps(payload)}\n\n"
-
-                yield "data: [DONE]\n\n"
-
-                await self._write_memories(
-                    tenant,
-                    msgs + [{
+                if not tool_calls_detected:
+                    yield "data: [DONE]\n\n"
+                    await self._write_memories(tenant, msgs + [{
                         "role": "assistant",
                         "content": self._maybe_prefix("".join(buf)),
                         "timestamp": datetime.now(timezone.utc).isoformat()
-                    }]
+                    }])
+                    if self.usage_hook:
+                        await _maybe(self.usage_hook, tenant, tokens, time.time() - t0)
+                    return
+
+                # TOOL CALL PATH
+                tool_calls = []
+                for i, (_, tc_partial) in enumerate(tool_call_parts.items()):
+                    tc = tc_partial.copy()
+                    tc["id"] = tc.get("id") or f"call_{i}"
+                    if not isinstance(tc["id"], str):
+                        tc["id"] = str(tc["id"])
+
+                    function = tc.get("function")
+                    if not isinstance(function, dict):
+                        continue  # ignorar tool_call inválido
+
+                    name = function.get("name")
+                    if not isinstance(name, str) or not name:
+                        continue  # ignorar tool_call incompleto
+
+                    if "arguments" not in function or not isinstance(function["arguments"], str):
+                        function["arguments"] = "{}"
+
+                    tc["function"] = function
+                    tool_calls.append(tc)
+
+                # ejecutar tools
+                final_tools = self.tools or []
+                local_tools = req.tools or []
+                if req.tools:
+                    final_tools += req.tools
+                    local_tools += req.tools
+                if tenant in self._tenant_tools:
+                    final_tools += self._tenant_tools[tenant]
+                    local_tools += self._tenant_tools[tenant]
+
+                available_tools = {t["function"]["name"]: t["function"] for t in final_tools}
+                local_tools = {t["function"]["name"]: t["function"] for t in local_tools or []}
+                tool_results = []
+
+                for tool_call in tool_calls:
+                    name = tool_call["function"]["name"]
+                    args_str = tool_call["function"].get("arguments", "")
+                    args = {}
+                    if args_str.strip():
+                        try:
+                            args = json.loads(args_str)
+                        except Exception as e:
+                            self._log(f"❌ Tool {name} args JSON error: {e}")
+                    local_tool_failed = False
+
+                    # Add debug logging BEFORE executing the tool
+                    self._log(f"⚙️ EXECUTING TOOL: {name} with args: {args}")
+
+                    if name in local_tools:
+                        try:
+                            self._log(f"⚙️ Calling local tool handler for: {name}")
+                            result = await self.local_tools_handler(tenant, name, args)
+                            self._log(f"⚙️ Local tool {name} result: {result}")
+                            tool_results.append({
+                                "tool_call_id": tool_call["id"],
+                                "role": "tool",
+                                "name": name,
+                                "content": str(result),
+                            })
+                            continue
+                        except Exception as e:
+                            self._log(f"❌ Local tool {name} error: {e}")
+                            self._log(f"❌ Exception type: {type(e)}")
+                            import traceback
+                            self._log(f"❌ Traceback: {traceback.format_exc()}")
+                            tool_results.append({
+                                "tool_call_id": tool_call["id"],
+                                "role": "tool",
+                                "name": name,
+                                "content": f"Error: {str(e)}"
+                            })
+                            local_tool_failed = True
+
+                    if name in available_tools and not local_tool_failed:
+                        try:
+                            self._log(f"⚙️ Calling remote tool handler for: {name}")
+                            result = await self._execute_tool(name, args)
+                            self._log(f"⚙️ Remote tool {name} result: {result}")
+                            tool_results.append({
+                                "tool_call_id": tool_call["id"],
+                                "role": "tool",
+                                "name": name,
+                                "content": str(result),
+                            })
+                        except Exception as e:
+                            tool_results.append({
+                                "tool_call_id": tool_call["id"],
+                                "role": "tool",
+                                "name": name,
+                                "content": f"Error executing tool: {str(e)}"
+                            })
+
+                followup_msgs = self._prune_msgs_for_tool_followup(original_msgs) + [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": tool_calls,
+                    },
+                    *tool_results
+                ]
+
+                followup_iter = await acompletion(
+                    model=req.model or self.default_model,
+                    messages=followup_msgs,
+                    stream=True
                 )
+
+                async for chunk in followup_iter:
+                    payload = json.loads(chunk.model_dump_json())
+                    delta = payload["choices"][0].get("delta", {}).get("content", "")
+                    if delta:
+                        buf.append(delta)
+                        tokens += len(delta)
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+                yield "data: [DONE]\n\n"
+                tool_call_parts.clear()   # 🔴 limpia para un posible 2.º ciclo
+
+                await self._write_memories(tenant, msgs + [{
+                    "role": "assistant",
+                    "content": self._maybe_prefix("".join(buf)),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }])
 
                 if self.usage_hook:
                     await _maybe(self.usage_hook, tenant, tokens, time.time() - t0)
