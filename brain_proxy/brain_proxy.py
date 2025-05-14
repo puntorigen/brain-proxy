@@ -47,6 +47,8 @@ Before doing anything else, IGNORE and DO NOT STORE:
   • Ephemeral operational states of the system (latency, rate limits, debug traces).
   • Polite fillers, apologies, or meta-comments that do not change future behaviour.
   • Messages that merely repeat existing memories without adding new facts.
+  • Messages that are related to a tool that's going to be executed or called.
+  • Messages that are not in the format of a tool call.
 
 --------------------------------------------------------------------------------
 1. 📥  EXTRACT & CONTEXTUALISE
@@ -1001,33 +1003,6 @@ class BrainProxy:
                 tool_calls_detected = False
                 current_call_idx = None  # Para rastrear el último índice válido
 
-                def merge_tool_call(base: dict, update: dict) -> dict:
-                    """
-                    Une un delta de tool_call con el estado acumulado.
-                    - 'name' se fija la primera vez que aparezca.
-                    - 'arguments' se van *concatenando* (son fragmentos de una string JSON).
-                    """
-                    result = base.copy()
-
-                    # --- id (no cambia) ---
-                    if update.get("id"):
-                        result["id"] = str(update["id"])
-
-                    # --- function payload ---
-                    upd_fn   = update.get("function", {})
-                    base_fn  = result.get("function", {})
-                    # name sólo si todavía no lo teníamos
-                    if "name" in upd_fn and not base_fn.get("name"):
-                        base_fn["name"] = upd_fn["name"]
-
-                    # concatenar argumentos
-                    if "arguments" in upd_fn:
-                        prev = base_fn.get("arguments", "")
-                        base_fn["arguments"] = f"{prev}{upd_fn['arguments']}"
-
-                    result["function"] = base_fn
-                    return result
-
                 async for chunk in upstream_iter:
                     try:
                         payload = json.loads(chunk.model_dump_json())
@@ -1211,15 +1186,14 @@ class BrainProxy:
 
                 async for chunk in followup_iter:
                     payload = json.loads(chunk.model_dump_json())
-                    delta = payload["choices"][0].get("delta", {}).get("content", "")
-                    if delta:
-                        buf.append(delta)
-                        tokens += len(delta)
+                    delta = payload["choices"][0].get("delta", {}) #.get("content", "")
+                    if "content" in delta:
+                        content = delta.get("content", "")
+                        buf.append(content or "")
+                        tokens += len(content or "")
                     yield f"data: {json.dumps(payload)}\n\n"
 
-                yield "data: [DONE]\n\n"
-                tool_call_parts.clear()   # 🔴 limpia para un posible 2.º ciclo
-
+                # TODO: make this run in other thread or background
                 await self._write_memories(tenant, msgs + [{
                     "role": "assistant",
                     "content": self._maybe_prefix("".join(buf)),
@@ -1228,6 +1202,11 @@ class BrainProxy:
 
                 if self.usage_hook:
                     await _maybe(self.usage_hook, tenant, tokens, time.time() - t0)
+
+                # Clear and yield done
+                buf.clear()
+                tool_call_parts.clear()   # 🔴 limpia para un posible 2.º ciclo
+                yield "data: [DONE]\n\n"
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
