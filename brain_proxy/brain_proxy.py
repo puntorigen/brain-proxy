@@ -999,6 +999,7 @@ class BrainProxy:
                 buf: List[str] = []
                 tool_call_parts: dict[str, dict] = {}
                 tool_calls_detected = False
+                current_call_idx = None  # Para rastrear el último índice válido
 
                 def merge_tool_call(base: dict, update: dict) -> dict:
                     """
@@ -1050,12 +1051,35 @@ class BrainProxy:
                     # 2️⃣  acumular tool calls
                     for tc in (delta.get("tool_calls", []) or []):
                         tool_calls_detected = True
-                        _id = tc.get("id") or f"call_{len(tool_call_parts)}"
-                        tc["id"] = _id
-                        if _id in tool_call_parts:
-                            tool_call_parts[_id] = merge_tool_call(tool_call_parts[_id], tc)
-                        else:
-                            tool_call_parts[_id] = tc
+                        
+                        # Usar el índice como clave para identificar la misma llamada en diferentes fragmentos
+                        idx = tc.get("index", current_call_idx)
+                        current_call_idx = idx  # Recordar el último índice válido
+                        if idx is None:
+                            continue  # Ignorar delta malformado
+                        
+                        # Obtener estructura acumulada o crear una nueva
+                        accum = tool_call_parts.get(idx, {
+                            "id": tc.get("id"),  # Solo aparecerá en el primer fragmento
+                            "type": "function",
+                            "function": {"name": None, "arguments": ""},
+                            "index": idx
+                        })
+                        
+                        # Fusionar con el fragmento actual
+                        fn = accum["function"]
+                        upd_fn = tc.get("function", {})
+                        if "name" in upd_fn and not fn["name"]:
+                            fn["name"] = upd_fn["name"]
+                        if "arguments" in upd_fn:
+                            fn["arguments"] += upd_fn["arguments"]
+                        
+                        # Guardar el ID real si está presente
+                        if tc.get("id"):
+                            accum["id"] = tc["id"]
+                        
+                        # Actualizar el acumulador
+                        tool_call_parts[idx] = accum
 
                         # IMPORTANT: Also yield this delta
                         yield f"data: {json.dumps(payload)}\n\n"

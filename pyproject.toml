@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brain-proxy"
-version = "0.1.44"
+version = "0.1.46"
 description = "OpenAI-compatible FastAPI router with Chroma + LangMem memory."
 authors = [
     {name = "Pablo Schaffner", email = "pablo@puntorigen.com"}
