@@ -441,6 +441,13 @@ class BrainProxy:
         """Extract and store memories from the conversation."""
         if not self.enable_memory:
             return
+        # Create a background task instead of processing immediately
+        asyncio.create_task(self._process_memories_background(tenant, conversation))
+        
+    async def _process_memories_background(
+        self, tenant: str, conversation: List[Dict[str, Any]]
+    ):
+        """Process and store memories in the background."""
         manager_tuple = self._get_mem_manager(tenant)
         if not manager_tuple:
             return
