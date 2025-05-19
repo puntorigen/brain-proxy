@@ -55,6 +55,8 @@ Before doing anything else, IGNORE and DO NOT STORE:
   • Capture stable facts, user preferences, goals, constraints, and relationships.
   • When uncertain, tag with a confidence score (p(x)=…).
   • Quote supporting snippets only when strictly necessary.
+  • Always keep the timestamps (date/time) of the messages.
+  • Always respond in english.
 
 --------------------------------------------------------------------------------
 2. 🔄  COMPARE & UPDATE
@@ -313,10 +315,10 @@ class BrainProxy:
         self.router = APIRouter()
         self._mount()
 
-    def _log(self, message: str) -> None:
+    def _log(self, message: str, *args) -> None:
         """Log debug messages only when debug is enabled."""
         if self.debug:
-            print(message)
+            print(message, *args)
 
     def _maybe_prefix(self, text: str) -> str:
         """Return [timestamp] text if temporal_awareness on; else plain text."""
@@ -720,13 +722,15 @@ class BrainProxy:
         
         return valid_msgs
 
-    async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None, tenant: Optional[str] = None):
+    async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None, tenant: Optional[str] = None, temperature: Optional[float] = None):
         """Dispatch to litellm API with tools support"""
         kwargs = {
             "model": model,
             "messages": msgs,
             "stream": stream
         }
+        if temperature:
+            kwargs["temperature"] = temperature
         
         # Combine server-defined tools with request tools if any
         final_tools = []
@@ -905,6 +909,7 @@ class BrainProxy:
                 await _maybe(self.auth_hook, request, tenant)
 
             body = await request.json()
+            #self._log(f"Preprocess Chat request for tenant {tenant}", body)
             req = ChatRequest(**body)
             msgs, files = self._split_files(req.messages)
 
@@ -961,12 +966,18 @@ class BrainProxy:
             msgs = self._prune_msgs_for_tool_followup(msgs)
             original_msgs = list(msgs)  # copia para evitar mutaciones posteriores
 
+            # set temperature only if we're assigned tools throght the endpoint for this tenant
+            temperature_ = None
+            if tenant in self._tenant_tools:
+                temperature_ = 0.4
+
             upstream_iter = await self._dispatch(
                 msgs, 
                 req.model or self.default_model, 
                 stream=req.stream,
                 tools=req.tools,
-                tenant=tenant
+                tenant=tenant,
+                temperature=temperature_
             )
             t0 = time.time()
 
@@ -1011,10 +1022,10 @@ class BrainProxy:
 
                     choice = payload["choices"][0]
                     delta = choice.get("delta", {})
-                    self._log(f"RAW CHUNK: {chunk}")
+                    #self._log(f"RAW CHUNK: {chunk}")
 
-                    if "tool_calls" in delta:
-                        self._log(f"TOOL CALLS IN DELTA: {delta['tool_calls']}")
+                    #if "tool_calls" in delta:
+                        #self._log(f"TOOL CALLS IN DELTA: {delta['tool_calls']}")
 
 
                     # 1️⃣  acumular textos normales
