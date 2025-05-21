@@ -911,6 +911,7 @@ class BrainProxy:
 
         @self.router.post("/{tenant}/chat/completions")
         async def chat(request: Request, tenant: str):
+            self._log("Version 2, 21-may-2025")
             # Special handling auth
             if self.auth_hook:
                 await _maybe(self.auth_hook, request, tenant)
@@ -976,6 +977,7 @@ class BrainProxy:
             # set temperature only if we're assigned tools throght the endpoint for this tenant
             temperature_ = None
             if tenant in self._tenant_tools:
+                # TODO: make this dynamic based on the number of tools assigned
                 temperature_ = 0.4
 
             upstream_iter = await self._dispatch(
@@ -1013,71 +1015,111 @@ class BrainProxy:
                     )
                 return JSONResponse(response_data)
 
+            async def _process_chunk_payload(chunk) -> dict:
+                """Process a chunk into a payload."""
+                try:
+                    return json.loads(chunk.model_dump_json())
+                except Exception:
+                    return chunk
+
+            async def _handle_content_delta(delta: dict, buf: List[str], tokens: int, payload: dict) -> tuple[List[str], int, str]:
+                """Handle content delta updates."""
+                if "content" in delta and delta["content"] is not None:
+                    buf.append(delta["content"])
+                    tokens += len(delta["content"])
+                    return buf, tokens, f"data: {json.dumps(payload)}\n\n"
+                return buf, tokens, ""
+
+            async def _process_tool_call(tc: dict, tool_call_parts: dict, current_call_idx: Optional[int]) -> tuple[dict, Optional[int]]:
+                """Process a single tool call and update the accumulator."""
+                idx = tc.get("index", current_call_idx)
+                if idx is None:
+                    return tool_call_parts, current_call_idx
+
+                accum = tool_call_parts.get(idx, {
+                    "id": tc.get("id"),
+                    "type": "function",
+                    "function": {"name": None, "arguments": ""},
+                    "index": idx
+                })
+
+                fn = accum["function"]
+                upd_fn = tc.get("function", {})
+                if "name" in upd_fn and not fn["name"]:
+                    fn["name"] = upd_fn["name"]
+                if "arguments" in upd_fn:
+                    fn["arguments"] += upd_fn["arguments"]
+
+                if tc.get("id"):
+                    accum["id"] = tc["id"]
+
+                tool_call_parts[idx] = accum
+                return tool_call_parts, idx
+
+            async def _prepare_tool_calls(tool_call_parts: dict) -> List[dict]:
+                """Prepare and validate tool calls for execution."""
+                tool_calls = []
+                for i, (_, tc_partial) in enumerate(tool_call_parts.items()):
+                    tc = tc_partial.copy()
+                    tc["id"] = tc.get("id") or f"call_{i}"
+                    if not isinstance(tc["id"], str):
+                        tc["id"] = str(tc["id"])
+
+                    function = tc.get("function")
+                    if not isinstance(function, dict):
+                        continue
+
+                    name = function.get("name")
+                    if not isinstance(name, str) or not name:
+                        continue
+
+                    if "arguments" not in function or not isinstance(function["arguments"], str):
+                        function["arguments"] = "{}"
+
+                    tc["function"] = function
+                    tool_calls.append(tc)
+                return tool_calls
+
+            async def _get_final_tools(tenant: str, req) -> tuple[List[dict], dict, dict]:
+                """Get final tools list and create tool mappings."""
+                final_tools = self.tools or []
+                local_tools = req.tools or []
+                if req.tools:
+                    final_tools += req.tools
+                    local_tools += req.tools
+                if tenant in self._tenant_tools:
+                    final_tools += self._tenant_tools[tenant]
+                    local_tools += self._tenant_tools[tenant]
+
+                available_tools = {t["function"]["name"]: t["function"] for t in final_tools}
+                local_tools_dict = {t["function"]["name"]: t["function"] for t in local_tools or []}
+                return final_tools, available_tools, local_tools_dict
+
             # streaming path
             async def event_stream() -> AsyncIterator[str]:
                 tokens = 0
                 buf: List[str] = []
                 tool_call_parts: dict[str, dict] = {}
                 tool_calls_detected = False
-                current_call_idx = None  # Para rastrear el último índice válido
+                current_call_idx = None
 
                 async for chunk in upstream_iter:
-                    try:
-                        payload = json.loads(chunk.model_dump_json())
-                    except Exception:
-                        payload = chunk
-
+                    payload = await _process_chunk_payload(chunk)
                     choice = payload["choices"][0]
                     delta = choice.get("delta", {})
-                    #self._log(f"RAW CHUNK: {chunk}")
 
-                    #if "tool_calls" in delta:
-                        #self._log(f"TOOL CALLS IN DELTA: {delta['tool_calls']}")
+                    # Handle content delta
+                    buf, tokens, content_response = await _handle_content_delta(delta, buf, tokens, payload)
+                    if content_response:
+                        yield content_response
 
-
-                    # 1️⃣  acumular textos normales
-                    if "content" in delta and delta["content"] is not None:
-                        buf.append(delta["content"])
-                        tokens += len(delta["content"])
-                        yield f"data: {json.dumps(payload)}\n\n"
-
-                    # 2️⃣  acumular tool calls
+                    # Handle tool calls
                     for tc in (delta.get("tool_calls", []) or []):
                         tool_calls_detected = True
-                        
-                        # Usar el índice como clave para identificar la misma llamada en diferentes fragmentos
-                        idx = tc.get("index", current_call_idx)
-                        current_call_idx = idx  # Recordar el último índice válido
-                        if idx is None:
-                            continue  # Ignorar delta malformado
-                        
-                        # Obtener estructura acumulada o crear una nueva
-                        accum = tool_call_parts.get(idx, {
-                            "id": tc.get("id"),  # Solo aparecerá en el primer fragmento
-                            "type": "function",
-                            "function": {"name": None, "arguments": ""},
-                            "index": idx
-                        })
-                        
-                        # Fusionar con el fragmento actual
-                        fn = accum["function"]
-                        upd_fn = tc.get("function", {})
-                        if "name" in upd_fn and not fn["name"]:
-                            fn["name"] = upd_fn["name"]
-                        if "arguments" in upd_fn:
-                            fn["arguments"] += upd_fn["arguments"]
-                        
-                        # Guardar el ID real si está presente
-                        if tc.get("id"):
-                            accum["id"] = tc["id"]
-                        
-                        # Actualizar el acumulador
-                        tool_call_parts[idx] = accum
-
-                        # IMPORTANT: Also yield this delta
+                        tool_call_parts, current_call_idx = await _process_tool_call(tc, tool_call_parts, current_call_idx)
                         yield f"data: {json.dumps(payload)}\n\n"
 
-                    # 3️⃣  ¿termina la llamada a herramientas?
+                    # Check for tool calls completion
                     if choice.get("finish_reason") == "tool_calls":
                         self._log(f"TOOL CALLS FINISHED! Found {len(tool_call_parts)} calls: {tool_call_parts}")
                         break
@@ -1093,40 +1135,9 @@ class BrainProxy:
                         await _maybe(self.usage_hook, tenant, tokens, time.time() - t0)
                     return
 
-                # TOOL CALL PATH
-                tool_calls = []
-                for i, (_, tc_partial) in enumerate(tool_call_parts.items()):
-                    tc = tc_partial.copy()
-                    tc["id"] = tc.get("id") or f"call_{i}"
-                    if not isinstance(tc["id"], str):
-                        tc["id"] = str(tc["id"])
-
-                    function = tc.get("function")
-                    if not isinstance(function, dict):
-                        continue  # ignorar tool_call inválido
-
-                    name = function.get("name")
-                    if not isinstance(name, str) or not name:
-                        continue  # ignorar tool_call incompleto
-
-                    if "arguments" not in function or not isinstance(function["arguments"], str):
-                        function["arguments"] = "{}"
-
-                    tc["function"] = function
-                    tool_calls.append(tc)
-
-                # ejecutar tools
-                final_tools = self.tools or []
-                local_tools = req.tools or []
-                if req.tools:
-                    final_tools += req.tools
-                    local_tools += req.tools
-                if tenant in self._tenant_tools:
-                    final_tools += self._tenant_tools[tenant]
-                    local_tools += self._tenant_tools[tenant]
-
-                available_tools = {t["function"]["name"]: t["function"] for t in final_tools}
-                local_tools = {t["function"]["name"]: t["function"] for t in local_tools or []}
+                # Process tool calls
+                tool_calls = await _prepare_tool_calls(tool_call_parts)
+                final_tools, available_tools, local_tools = await _get_final_tools(tenant, req)
                 tool_results = []
 
                 for tool_call in tool_calls:
@@ -1196,6 +1207,7 @@ class BrainProxy:
                     *tool_results
                 ]
 
+                # TODO: send the tools here as well if they're defined; or refactor to make the calls in a loop
                 followup_iter = await acompletion(
                     model=req.model or self.default_model,
                     messages=followup_msgs,
