@@ -707,7 +707,52 @@ You can also disable automatic tool registration if needed:
 proxy = BrainProxy(use_registry_tools=False)
 ```
 
-## 📑 Custom Document Processing
+## � Streaming & Multi-Tool Support
+
+brain-proxy now features robust support for streaming responses with multiple tool calls, making it perfect for complex, interactive AI applications. The streaming system has been completely redesigned to handle:
+
+- Multiple concurrent tool calls within a single streaming response
+- Index-based tracking for reliable tool call ordering
+- Robust argument accumulation across stream chunks
+- Proper preservation of tool call IDs
+- Enhanced tool call structure with smart defaults
+
+Example of handling streamed multi-tool responses:
+
+```python
+from brain_proxy import BrainProxy, tool
+
+@tool(description="Search the web")
+async def search_web(query: str) -> str:
+    return f"Results for: {query}"
+
+@tool(description="Analyze sentiment")
+async def analyze_sentiment(text: str) -> str:
+    return "positive"
+
+proxy = BrainProxy()
+
+# The LLM can now make multiple tool calls in a single streaming response
+# Each tool call is properly tracked and managed, even when split across chunks
+response = await proxy.chat.completions.create(
+    messages=[{"role": "user", "content": "Search for latest news and analyze their sentiment"}],
+    stream=True
+)
+
+async for chunk in response:
+    # Tool calls are automatically tracked and managed
+    print(chunk)
+```
+
+The improved streaming system ensures reliable handling of complex interactions where the AI needs to:
+1. Make multiple tool calls in sequence
+2. Process tool results while streaming
+3. Maintain context across stream chunks
+4. Handle parallel tool executions
+
+This makes brain-proxy ideal for building sophisticated AI applications that require real-time interaction and complex tool usage.
+
+## �📑 Custom Document Processing
 
 The `extract_text` function now supports returning either a string or a list of LangChain `Document` objects:
 
