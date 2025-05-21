@@ -7,4 +7,5 @@ __pycache__/
 .chroma/
 tenants/
 dist/
+build/
 #examples/
