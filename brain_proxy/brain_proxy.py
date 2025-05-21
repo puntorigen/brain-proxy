@@ -11,6 +11,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, Union
 from .tools import get_registry
+from .__version__ import __version__
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -911,7 +912,7 @@ class BrainProxy:
 
         @self.router.post("/{tenant}/chat/completions")
         async def chat(request: Request, tenant: str):
-            self._log("Version 2, 21-may-2025")
+            self._log(f"Version {__version__}")
             # Special handling auth
             if self.auth_hook:
                 await _maybe(self.auth_hook, request, tenant)
@@ -1208,20 +1209,121 @@ class BrainProxy:
                 ]
 
                 # TODO: send the tools here as well if they're defined; or refactor to make the calls in a loop
-                followup_iter = await acompletion(
-                    model=req.model or self.default_model,
-                    messages=followup_msgs,
-                    stream=True
-                )
+                # Recursive follow-up loop after first tool call
+                while True:
+                    followup_iter = await acompletion(
+                        model=req.model or self.default_model,
+                        messages=followup_msgs,
+                        stream=True,
+                        tools=final_tools,
+                        tool_choice="auto"
+                    )
 
-                async for chunk in followup_iter:
-                    payload = json.loads(chunk.model_dump_json())
-                    delta = payload["choices"][0].get("delta", {}) #.get("content", "")
-                    if "content" in delta:
-                        content = delta.get("content", "")
-                        buf.append(content or "")
-                        tokens += len(content or "")
-                    yield f"data: {json.dumps(payload)}\n\n"
+                    tool_calls_detected = False
+                    tool_call_parts = {}
+                    current_call_idx = None
+
+                    async for chunk in followup_iter:
+                        payload = json.loads(chunk.model_dump_json())
+                        choice = payload["choices"][0]
+                        delta = choice.get("delta", {})
+
+                        # Handle streaming content
+                        if "content" in delta:
+                            content = delta.get("content", "")
+                            buf.append(content or "")
+                            tokens += len(content or "")
+                        yield f"data: {json.dumps(payload)}\n\n"
+
+                        # Detect additional tool calls
+                        for tc in (delta.get("tool_calls", []) or []):
+                            tool_calls_detected = True
+                            idx = tc.get("index", current_call_idx)
+                            current_call_idx = idx
+                            if idx is None:
+                                continue
+
+                            accum = tool_call_parts.get(idx, {
+                                "id": tc.get("id"),
+                                "type": "function",
+                                "function": {"name": None, "arguments": ""},
+                                "index": idx
+                            })
+
+                            fn = accum["function"]
+                            upd_fn = tc.get("function", {})
+                            if "name" in upd_fn and not fn["name"]:
+                                fn["name"] = upd_fn["name"]
+                            if "arguments" in upd_fn:
+                                fn["arguments"] += upd_fn["arguments"]
+                            if tc.get("id"):
+                                accum["id"] = tc["id"]
+                            tool_call_parts[idx] = accum
+                            yield f"data: {json.dumps(payload)}\n\n"
+
+                        if choice.get("finish_reason") == "tool_calls":
+                            break
+
+                    if not tool_calls_detected:
+                        break
+
+                    # Execute new tool calls
+                    new_tool_calls = await _prepare_tool_calls(tool_call_parts)
+                    new_tool_results = []
+                    for tool_call in new_tool_calls:
+                        name = tool_call["function"]["name"]
+                        args_str = tool_call["function"].get("arguments", "")
+                        args = {}
+                        if args_str.strip():
+                            try:
+                                args = json.loads(args_str)
+                            except Exception as e:
+                                self._log(f"❌ Tool {name} args JSON error: {e}")
+                        local_tool_failed = False
+                        if name in local_tools:
+                            try:
+                                result = await self.local_tools_handler(tenant, name, args)
+                                new_tool_results.append({
+                                    "tool_call_id": tool_call["id"],
+                                    "role": "tool",
+                                    "name": name,
+                                    "content": str(result),
+                                })
+                                continue
+                            except Exception as e:
+                                self._log(f"❌ Local tool {name} error: {e}")
+                                new_tool_results.append({
+                                    "tool_call_id": tool_call["id"],
+                                    "role": "tool",
+                                    "name": name,
+                                    "content": f"Error: {str(e)}"
+                                })
+                                local_tool_failed = True
+                        if name in available_tools and not local_tool_failed:
+                            try:
+                                result = await self._execute_tool(name, args)
+                                new_tool_results.append({
+                                    "tool_call_id": tool_call["id"],
+                                    "role": "tool",
+                                    "name": name,
+                                    "content": str(result),
+                                })
+                            except Exception as e:
+                                new_tool_results.append({
+                                    "tool_call_id": tool_call["id"],
+                                    "role": "tool",
+                                    "name": name,
+                                    "content": f"Error executing tool: {str(e)}"
+                                })
+
+                    followup_msgs = self._prune_msgs_for_tool_followup(followup_msgs) + [
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": new_tool_calls,
+                        },
+                        *new_tool_results
+                    ]
 
                 # TODO: make this run in other thread or background
                 await self._write_memories(tenant, msgs + [{
