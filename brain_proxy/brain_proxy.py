@@ -976,10 +976,15 @@ class BrainProxy:
             original_msgs = list(msgs)  # copia para evitar mutaciones posteriores
 
             # set temperature only if we're assigned tools throght the endpoint for this tenant
+            def get_temperature(tool_count: int) -> float:
+                return max(0.2, 1.0 - 0.1 * tool_count)
+
             temperature_ = None
             if tenant in self._tenant_tools:
                 # TODO: make this dynamic based on the number of tools assigned
-                temperature_ = 0.4
+                tool_count = len(self._tenant_tools[tenant])
+                temperature_ = get_temperature(tool_count)
+                self._log(f"Setting temperature to {temperature_} for tenant {tenant}")
 
             upstream_iter = await self._dispatch(
                 msgs, 
