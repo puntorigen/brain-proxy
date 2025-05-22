@@ -83,6 +83,7 @@ over raw chat fragments.  Use the agent’s first-person voice when relevant (�
 """
 
 
+
 # -------------------------------------------------------------------
 # Pydantic schemas (OpenAI spec + file‑data part)
 # -------------------------------------------------------------------
@@ -230,6 +231,7 @@ class BrainProxy:
         tools: Optional[List[Dict[str, Any]]] = None,
         use_registry_tools: bool = True,
         embedding_model: str = "openai/text-embedding-3-small",  # litellm format e.g. "azure/ada-002"
+        tool_filtering_model: Optional[str] = None,  # optional fast model to filter available tools (improves quality), e.g. "azure/gpt-35-turbo"
         mem_top_k: int = 6,
         mem_working_max: int = 12,
         enable_global_memory: bool = False, # enables _global tenant access from all tenants
@@ -274,6 +276,7 @@ class BrainProxy:
         self.enable_global_memory = enable_global_memory
         self.default_model = default_model
         self.embedding_model = embedding_model
+        self.tool_filtering_model = tool_filtering_model
         self.extract_text = extract_text or (
             lambda p, m: p.read_text("utf-8", "ignore")
         )
@@ -730,6 +733,51 @@ class BrainProxy:
         
         return valid_msgs
 
+    async def _filter_tools_via_llm(self, msgs: list[dict], tool_defs: List[dict]) -> List[dict]:
+        # 1. Get last user message content
+        user_prompt = next(
+            (msg["content"] for msg in reversed(msgs) if msg["role"] == "user" and isinstance(msg["content"], str)),
+            None
+        )
+        if not user_prompt:
+            return tool_defs  # fallback: return all if no user message found
+
+        # 2. Format available tools list
+        tools_str = "\n".join(
+            f"- {tool['function']['name']} ({tool['function'].get('description', 'No description')})"
+            for tool in tool_defs
+        )
+
+        # 3. Build prompt
+        prompt = f"""You are a helpful assistant that selects only the most relevant tools for a given user message.
+
+    The user wrote:
+    {user_prompt}
+
+    Available tools:
+    {tools_str}
+
+    Reply strictly in JSON format like:
+    {{"selected_tools": ["tool_name1", "tool_name2"]}}"""
+
+        # 4. Run LLM call
+        response = await acompletion(
+            model=self.tool_filtering_model or "gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You only reply with a JSON object listing selected tools."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        # 5. Parse the response
+        try:
+            parsed = json.loads(response.choices[0].message.content)
+            selected = parsed.get("selected_tools", [])
+            return [tool for tool in tool_defs if tool["function"]["name"] in selected]
+        except Exception as e:
+            self._log(f"[ToolFilter] Error parsing LLM response: {e}")
+            return tool_defs  # fallback: return all
+
     async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None, tenant: Optional[str] = None, temperature: Optional[float] = None):
         """Dispatch to litellm API with tools support"""
         kwargs = {
@@ -756,9 +804,10 @@ class BrainProxy:
         for tool in final_tools:
             by_name[tool['function']['name']] = tool
         final_tools = list(by_name.values())
-        if final_tools:
-            self._log(f"➡️  Enviando {len(final_tools)} tools: {[t['function']['name'] for t in final_tools]}")
-            kwargs["tools"] = final_tools
+        filtered_tools = await self._filter_tools_via_llm(msgs, final_tools)
+        if filtered_tools:
+            self._log(f"➡️  Enviando {len(filtered_tools)} of {len(final_tools)} tools: {[t['function']['name'] for t in filtered_tools]}")
+            kwargs["tools"] = filtered_tools
             kwargs["tool_choice"] = "auto"  # Let the model decide when to use tools
                     
         msgs = self._validate_messages(msgs)
@@ -912,7 +961,7 @@ class BrainProxy:
 
         @self.router.post("/{tenant}/chat/completions")
         async def chat(request: Request, tenant: str):
-            self._log(f"Version {__version__}")
+            self._log(f"Brain-Proxy - Version {__version__}")
             # Special handling auth
             if self.auth_hook:
                 await _maybe(self.auth_hook, request, tenant)
@@ -977,7 +1026,7 @@ class BrainProxy:
 
             # set temperature only if we're assigned tools throght the endpoint for this tenant
             def get_temperature(tool_count: int) -> float:
-                return max(0.2, 1.0 - 0.1 * tool_count)
+                return max(0.1, 1.0 - 0.1 * tool_count)
 
             temperature_ = None
             if tenant in self._tenant_tools:
@@ -1216,11 +1265,14 @@ class BrainProxy:
                 # TODO: send the tools here as well if they're defined; or refactor to make the calls in a loop
                 # Recursive follow-up loop after first tool call
                 while True:
+                    filtered_tools = await self._filter_tools_via_llm(followup_msgs, final_tools)
+                    if filtered_tools:
+                        self._log(f"➡️  Enviando {len(filtered_tools)} of {len(final_tools)} tools ...")
                     followup_iter = await acompletion(
                         model=req.model or self.default_model,
                         messages=followup_msgs,
                         stream=True,
-                        tools=final_tools,
+                        tools=filtered_tools,
                         tool_choice="auto"
                     )
 

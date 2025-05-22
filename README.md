@@ -95,7 +95,36 @@ BrainProxy(
 )
 ```
 
-### ⚠️ Important: API Keys and Default Models
+### 🛠️ Tool Management and Response Quality
+
+#### Tool Filtering System
+
+The `tool_filtering_model` parameter enables smart tool filtering, allowing you to use a large number of tools without degrading model performance:
+
+```python
+proxy = BrainProxy(
+    default_model="openai/gpt-4o",
+    tool_filtering_model="openai/gpt-3.5-turbo",  # Faster model for tool filtering
+)
+```
+
+Benefits:
+- No limit on the number of available tools
+- Improved response quality by pre-filtering irrelevant tools
+- More efficient model usage by only sending relevant tools
+- Better tool selection accuracy
+
+#### Dynamic Temperature
+
+Brain-proxy now automatically adjusts the temperature parameter based on the number of active tools being used. This feature:
+- Optimizes response creativity vs precision
+- Adapts to the complexity of available tools
+- Improves overall response quality
+- Requires no manual configuration
+
+This dynamic temperature adjustment helps maintain high-quality responses even when working with multiple tools.
+
+### 🧠 Memory Settings Explained
 
 #### Default Models
 
