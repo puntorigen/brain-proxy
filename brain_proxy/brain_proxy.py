@@ -35,7 +35,9 @@ class Memory(BaseModel):
     content: str
 
 # LangMem primitives (functions, not classes)
-from langmem import create_memory_manager
+from langmem import create_memory_manager, create_memory_store_manager
+from langgraph.store.memory import InMemoryStore
+from langchain_community.vectorstores.upstash import UpstashVectorStore as InUpstashStore
 
 _MEMORY_INSTRUCTIONS = """
 You are a long-term memory manager that maintains semantic, procedural, and episodic memories
@@ -316,6 +318,17 @@ class BrainProxy:
             # Otherwise use ChromaDB
             self.vec_factory = lambda tenant: vector_store_factory(tenant, self.embeddings, max_workers=max_workers)
         
+        ## Init langmem
+        def create_store(tenant):
+            langmem_store = InUpstashStore(
+                embedding=self.embeddings,
+                index_url=upstash_rest_url,
+                index_token=upstash_rest_token,
+                namespace=tenant,
+            )
+            return langmem_store
+        self.create_store = create_store
+        ##
         self.router = APIRouter()
         self._mount()
 
@@ -339,49 +352,34 @@ class BrainProxy:
             return self._mem_managers[tenant]
 
         # use the tenant's chroma collection for memory as well
-        vec = self.vec_factory(f"{tenant}_memory")
-        async def _search_mem(query: str, k: int):
-            docs = await vec.similarity_search(query, k=k)
-            return [d.page_content for d in docs]
+        store = self.create_store(tenant)
+        manager = create_memory_store_manager(
+            ChatLiteLLM(model=self.memory_model), 
+            instructions=_MEMORY_INSTRUCTIONS,
+            namespace=("project", tenant),
+            store=store
+        )
+
+        async def _search_mem(query: str):
+            docs = await manager.asearch(
+                query, 
+                config={
+                    "configurable": {"langgraph_user_id": tenant}
+                }
+            )
+            self._log(f"Found {len(docs)} memories for tenant {tenant}",docs)
+            return [d.value['content'] for d in docs]
 
         async def _store_mem(memories: List[Any]):
             """Store memories in the vector database."""
-            docs = []
-            for m in memories:
-                try:
-                    # Convert any memory format to a string and store it
-                    if hasattr(m, 'content'):
-                        content = str(m.content)
-                    elif isinstance(m, dict) and 'content=' in m:
-                        content = str(m['content='])
-                    elif isinstance(m, dict) and 'content' in m:
-                        content = str(m['content'])
-                    elif isinstance(m, str):
-                        content = m
-                    else:
-                        content = str(m)
-                    
-                    now_iso = datetime.now(timezone.utc).isoformat()
-                    docs.append(
-                        Document(
-                            page_content=self._maybe_prefix(content),
-                            metadata={
-                                "timestamp": now_iso
-                            }
-                        )
-                    )
-                except Exception as e:
-                    self._log(f"Error processing memory: {e}")
-            
-            if docs:
-                self._log(f"Storing {len(docs)} memories for tenant {tenant}")
-                await vec.add_documents(docs)
-                self._log(f"Successfully stored memories")
+            await manager.ainvoke(
+                {   "messages": memories    },
+                config = {
+                    "configurable": {"langgraph_user_id": tenant}
+                }
+            )
 
         # Use langchain_litellm's ChatLiteLLM for memory manager directly
-        # No wrapper to avoid potential deadlocks
-        manager = create_memory_manager(ChatLiteLLM(model=self.memory_model), instructions=_MEMORY_INSTRUCTIONS)
-        
         self._mem_managers[tenant] = (manager, _search_mem, _store_mem)
         return self._mem_managers[tenant]
 
@@ -399,13 +397,13 @@ class BrainProxy:
 
         # 1️⃣  broad search in parallel
         raw: List[str] = []
-        search_tasks = [search(user_text, k=self.mem_top_k * 3)]
+        search_tasks = [search(user_text)]
 
         # Get global memories
         global_mgr, global_search, _ = self._get_mem_manager('_global')
 
         if self.enable_global_memory and global_mgr:
-            search_tasks.append(global_search(user_text, k=self.mem_top_k * 3))
+            search_tasks.append(global_search(user_text))
         
         # Gather results from all searches
         results = await asyncio.gather(*search_tasks)
@@ -413,30 +411,8 @@ class BrainProxy:
         if self.enable_global_memory and global_mgr:
             raw.extend(results[1])  # Global memories
 
-        # 2️⃣  try to detect a date / relative phrase
-        timerange = extract_timerange(user_text) if self.temporal_awareness else None
-        if timerange:
-            start, end = timerange
-            filtered = []
-            for mem in raw:
-                # we stored ISO timestamps in the memory doc’s metadata and also
-                # prefixed them in text like “[2025-06-20T14:03:00+00:00] …”
-                m = re.match(r"\[(\d{4}-\d{2}-\d{2}T[^]]+)\]", mem)
-                ts = m.group(1) if m else ""
-                if ts and start.isoformat() <= ts <= end.isoformat():
-                    filtered.append(mem)
-            memories = filtered or raw
-        else:
-            memories = raw
-
-        # Sort memories by timestamp (oldest first) if they have timestamps
-        def extract_timestamp(memory):
-            m = re.match(r"\[(\d{4}-\d{2}-\d{2}T[^]]+)\]", memory)
-            return m.group(1) if m else "0" # Default to oldest if no timestamp
-
-        memories.sort(key=extract_timestamp)  # Oldest first
         # Take the last k memories (most recent ones)
-        memories = memories[-self.mem_top_k:]
+        memories = raw #[-self.mem_top_k:]
         return "\\n".join(memories)  # Return the last k memories
 
     async def _write_memories(
@@ -455,126 +431,11 @@ class BrainProxy:
         manager_tuple = self._get_mem_manager(tenant)
         if not manager_tuple:
             return
-        manager, _, store = manager_tuple
+        _, _, store = manager_tuple
         
         try:
-            # Get memories from the manager
-            self._log(f"Extracting memories for tenant {tenant}")
-            raw_memories = await manager(conversation)
-            
-            # Debug logging to understand the format
-            self._log(f"Raw memory count: {len(raw_memories) if raw_memories else 0}")
-            if raw_memories and self.debug:
-                for i, mem in enumerate(raw_memories):
-                    self._log(f"Raw memory {i+1} type: {type(mem)}")
-                    if hasattr(mem, 'id') and hasattr(mem, 'content'):
-                        self._log(f"  String representation: {str(mem)[:50]}")
-            
-            # Convert ExtractedMemory objects to proper format
-            if raw_memories:
-                # Create a list to hold properly formatted memories
-                proper_memories = []
-                
-                for mem in raw_memories:
-                    try:
-                        # Extract the content properly based on the object type
-                        
-                        # Case 1: ExtractedMemory named tuple (id, content)
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        if hasattr(mem, 'id') and hasattr(mem, 'content'):
-                            if hasattr(mem.content, 'content'):
-                                # Extract content from the BaseModel
-                                content = mem.content.content
-                                formatted_mem = {"content": self._maybe_prefix(content)}
-                                proper_memories.append(formatted_mem)
-                            elif hasattr(mem.content, 'model_dump'):
-                                # Extract content using model_dump method
-                                model_data = mem.content.model_dump()
-                                if 'content' in model_data:
-                                    formatted_mem = {"content": self._maybe_prefix(model_data['content'])}
-                                    proper_memories.append(formatted_mem)
-                                else:
-                                    # If no content field, use the whole model data as string
-                                    formatted_mem = {"content": self._maybe_prefix(str(model_data))}
-                                    proper_memories.append(formatted_mem)
-                            elif isinstance(mem.content, dict) and 'content' in mem.content:
-                                # Content is a dict with content field
-                                formatted_mem = {"content": self._maybe_prefix(mem.content['content'])}
-                                proper_memories.append(formatted_mem)
-                            else:
-                                # Fallback for other types
-                                formatted_mem = {"content": self._maybe_prefix(str(mem.content))}
-                                proper_memories.append(formatted_mem)
-                                
-                        # Case 2: Dictionary with 'content' key
-                        elif isinstance(mem, dict) and 'content' in mem:
-                            formatted_mem = {"content": self._maybe_prefix(str(mem['content']))}
-                            proper_memories.append(formatted_mem)
-                            
-                        # Case 3: Malformed dictionaries with format {'content=': val, 'text': val}
-                        elif isinstance(mem, dict) and 'content=' in mem:
-                            # Find text fields (longer string keys)
-                            text_keys = [k for k in mem.keys() 
-                                       if k != 'content=' and isinstance(k, str) and len(k) > 10]
-                            
-                            if text_keys:
-                                # Use the text key with actual content
-                                longest_key = max(text_keys, key=len)
-                                formatted_mem = {"content": self._maybe_prefix(longest_key)}
-                                proper_memories.append(formatted_mem)
-                                self._log(f"  Fixed complex memory format: {longest_key[:30]}...")
-                            else:
-                                # Fallback: concatenate all string values
-                                content_parts = []
-                                for k, v in mem.items():
-                                    if isinstance(v, str) and len(v) > 2:
-                                        content_parts.append(v)
-                                    elif isinstance(k, str) and len(k) > 10 and k != 'content=':
-                                        content_parts.append(k)
-                                        
-                                if content_parts:
-                                    content = " ".join(content_parts)
-                                    formatted_mem = {"content": self._maybe_prefix(content)}
-                                    proper_memories.append(formatted_mem)
-                                else:
-                                    # Last resort: use content= value
-                                    formatted_mem = {"content": self._maybe_prefix(str(mem['content=']))}
-                                    proper_memories.append(formatted_mem)
-                            
-                        # Case 4: String value
-                        elif isinstance(mem, str):
-                            formatted_mem = {"content": self._maybe_prefix(mem)}
-                            proper_memories.append(formatted_mem)
-                            
-                        # Case 5: Any other object with __dict__ attribute
-                        elif hasattr(mem, '__dict__'):
-                            mem_dict = mem.__dict__
-                            if 'content' in mem_dict:
-                                formatted_mem = {"content": self._maybe_prefix(str(mem_dict['content']))}
-                                proper_memories.append(formatted_mem)
-                            else:
-                                # Use the entire object representation
-                                formatted_mem = {"content": self._maybe_prefix(str(mem))}
-                                proper_memories.append(formatted_mem)
-                        
-                        # If nothing worked, skip this memory
-                        else:
-                            self._log(f"  Could not extract content from memory: {type(mem)}")
-                            
-                    except Exception as e:
-                        self._log(f"  Error formatting memory: {e}")
-                        continue
-                
-                self._log(f"Formatted {len(proper_memories)} memories properly")
-                
-                if proper_memories:
-                    # Store the properly formatted memories
-                    self._log(f"Storing {len(proper_memories)} memories for tenant {tenant}")
-                    await store(proper_memories)
-                    self._log(f"Successfully stored memories")
-                    self._log(f"Memory storage complete")
-            else:
-                self._log("No memories to store")
+            await store(conversation)
+            self._log(f"Successfully stored memories")
                 
         except Exception as e:
             self._log(f"Error in memory processing: {e}")
