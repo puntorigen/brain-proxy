@@ -749,15 +749,16 @@ class BrainProxy:
         )
 
         # 3. Build prompt
-        prompt = f"""You are a helpful assistant that selects only the most relevant tools for a given user message.
+        prompt = f"""You are a helpful assistant that selects the most relevant tools for a given user message.
 
     The user wrote:
-    {user_prompt}
+    ```{user_prompt}```
 
     Available tools:
-    {tools_str}
+    ``` {tools_str}````
 
-    Reply strictly in JSON format like:
+    # Try to always return the 2-5 most similar tools to the user message.
+    # Reply strictly in JSON format like:
     {{"selected_tools": ["tool_name1", "tool_name2"]}}"""
 
         # 4. Run LLM call
