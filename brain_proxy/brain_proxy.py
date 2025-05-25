@@ -672,7 +672,7 @@ class BrainProxy:
 
         if docs:
             vec = self.vec_factory(tenant)
-            vec.add_documents(docs)
+            await vec.add_documents(docs)
 
     # ----------------------------------------------------------------
     # RAG
