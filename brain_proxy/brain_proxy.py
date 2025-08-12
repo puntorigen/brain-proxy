@@ -244,6 +244,7 @@ class BrainProxy:
         auth_hook: Optional[Callable[[Request, str], Any]] = None,
         usage_hook: Optional[Callable[[str, int, float], Any]] = None,
         local_tools_handler: Optional[Callable[[str, str, Dict[str, Any]], Any]] = None,
+        on_thinking: Optional[Callable[[str, str], Any]] = None,  # Callback (tenant_id, state) for 'thinking'/'ready' states
         max_upload_mb: int = 20,
         temporal_awareness: bool = True, # enable temporal awareness (time tracking of knowledge)
         system_prompt: Optional[str] = None,
@@ -284,6 +285,7 @@ class BrainProxy:
         self.auth_hook = auth_hook
         self.usage_hook = usage_hook
         self.local_tools_handler = local_tools_handler
+        self.on_thinking = on_thinking
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self._mem_managers: Dict[str, Any] = {}
         self._tenant_tools: Dict[str, Any] = {}
@@ -757,7 +759,7 @@ class BrainProxy:
     Available tools:
     ``` {tools_str}````
 
-    # Try to always return the 2-5 most similar tools to the user message.
+    # Try to always return the 2-5 most similar or related tools to the user message.
     # Reply strictly in JSON format like:
     {{"selected_tools": ["tool_name1", "tool_name2"]}}"""
 
@@ -772,11 +774,34 @@ class BrainProxy:
 
         # 5. Parse the response
         try:
-            parsed = json.loads(response.choices[0].message.content)
+            content = response.choices[0].message.content.strip()
+            
+            # Try to extract JSON from markdown code blocks if present
+            if content.startswith('```'):
+                # Look for content between ```json and ``` or between ``` and ```
+                lines = content.split('\n')
+                json_lines = []
+                in_code_block = False
+                
+                for line in lines:
+                    if line.strip().startswith('```'):
+                        if in_code_block:
+                            break  # End of code block
+                        else:
+                            in_code_block = True  # Start of code block
+                            continue
+                    elif in_code_block:
+                        json_lines.append(line)
+                
+                if json_lines:
+                    content = '\n'.join(json_lines).strip()
+            
+            # Parse the JSON content
+            parsed = json.loads(content)
             selected = parsed.get("selected_tools", [])
             return [tool for tool in tool_defs if tool["function"]["name"] in selected]
         except Exception as e:
-            self._log(f"[ToolFilter] Error parsing LLM response: {e}")
+            self._log(f"[ToolFilter] Error parsing LLM response: {e}", response)
             return tool_defs  # fallback: return all
 
     async def _dispatch(self, msgs, model: str, *, stream: bool, tools: Optional[List[Dict[str, Any]]] = None, tenant: Optional[str] = None, temperature: Optional[float] = None):
@@ -1006,6 +1031,15 @@ class BrainProxy:
                     )
                 )
                 self._log(f"Extracting user text: '{user_text[:30]}...'")
+                
+                # Trigger on_thinking callback with 'thinking' state
+                if self.on_thinking:
+                    try:
+                        await _maybe(self.on_thinking, tenant, 'thinking')
+                        self._log(f"on_thinking callback triggered with 'thinking' state for tenant {tenant}")
+                    except Exception as e:
+                        self._log(f"Error in on_thinking callback: {e}")
+                
                 mem_block = await self._retrieve_memories(tenant, user_text)
                 if mem_block:
                     self._log(f"Adding memory block to conversation: {len(mem_block)} chars")
@@ -1047,6 +1081,14 @@ class BrainProxy:
             t0 = time.time()
 
             if not req.stream:
+                # Trigger on_thinking callback with 'ready' state before sending response
+                if self.on_thinking:
+                    try:
+                        await _maybe(self.on_thinking, tenant, 'ready')
+                        self._log(f"on_thinking callback triggered with 'ready' state for tenant {tenant}")
+                    except Exception as e:
+                        self._log(f"Error in on_thinking callback (ready state): {e}")
+                
                 # No need to await here since _dispatch already returns the complete response
                 response_data = upstream_iter.model_dump()
                 await self._write_memories(
@@ -1153,6 +1195,14 @@ class BrainProxy:
 
             # streaming path
             async def event_stream() -> AsyncIterator[str]:
+                # Trigger on_thinking callback with 'ready' state before streaming
+                if self.on_thinking:
+                    try:
+                        await _maybe(self.on_thinking, tenant, 'ready')
+                        self._log(f"on_thinking callback triggered with 'ready' state for tenant {tenant} (streaming)")
+                    except Exception as e:
+                        self._log(f"Error in on_thinking callback (ready state, streaming): {e}")
+                
                 tokens = 0
                 buf: List[str] = []
                 tool_call_parts: dict[str, dict] = {}

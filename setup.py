@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="brain-proxy",
-    version="0.1.61",
+    version="0.1.62",
     description="OpenAI-compatible FastAPI router with Chroma + LangMem memory.",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",

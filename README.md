@@ -16,6 +16,7 @@
 - ✅ Tenant-specific file storage for improved organization and isolation
 - ✅ Streaming via Server-Sent Events
 - ✅ Custom text extractor support for PDFs, CSVs, etc.
+- ✅ Real-time processing feedback via `on_thinking` callback
 - ✅ No frontend changes required
 - ✅ **Now uses LiteLLM by default — specify any model using `provider/model` (e.g., `openai/gpt-4o`, `cerebras/llama3-70b-instruct`)**
 
@@ -35,11 +36,19 @@ pip install brain-proxy
 from fastapi import FastAPI
 from brain_proxy import BrainProxy
 
+# Optional: Add callback for UI feedback
+def on_thinking(tenant_id: str, state: str):
+    if state == 'thinking':
+        print(f"🧠 Retrieving memories for {tenant_id}...")
+    elif state == 'ready':
+        print(f"✅ Ready to respond to {tenant_id}")
+
 proxy = BrainProxy(
     default_model="openai/gpt-4o-mini",  # Default model in litellm format
     memory_model="openai/gpt-4o-mini",  # Memory model in litellm format
     embedding_model="openai/text-embedding-3-small",  # Embedding model in litellm format
     enable_memory=True,  # Enable/disable memory features (default True)
+    on_thinking=on_thinking,  # Optional callback for processing states
     debug=False,  # Enable detailed debug logging when needed
     storage_dir="tenants",  # Default base directory for tenant data
     enable_global_memory=False,  # Enable access to _global tenant from all tenants
@@ -86,6 +95,7 @@ BrainProxy(
     manager_fn=None,  # Multi-agent manager hook
     auth_hook=None,  # Authentication hook
     usage_hook=None,  # Usage tracking hook
+    on_thinking=None,  # Callback (tenant_id, state) for 'thinking'/'ready' states
     
     # File handling
     max_upload_mb=20,  # Maximum file upload size in MB
@@ -510,6 +520,122 @@ proxy = BrainProxy(
 The `manager_fn` hook is primarily designed for integrating with more complex agent frameworks or enabling custom message preprocessing before the chat completion is generated.
 
 With these hooks, you can build sophisticated multi-tenant applications with fine-grained security, usage monitoring, and dynamic agent delegation.
+
+### 🎯 `on_thinking` Callback - Real-time Processing Feedback
+
+The `on_thinking` callback provides real-time feedback about the processing state, perfect for updating UI loading states and animations.
+
+#### Callback Signature
+
+```python
+on_thinking: Optional[Callable[[str, str], Any]] = None
+```
+
+- **tenant_id** (str): The tenant identifier for the current request
+- **state** (str): The current processing state
+  - `'thinking'`: Triggered before memory retrieval starts (only when memory is enabled)
+  - `'ready'`: Triggered just before the response is sent (both streaming and non-streaming)
+
+#### State Flow
+
+```
+Request arrives
+    ↓
+[thinking] → Memory retrieval starts
+    ↓
+Processing with LLM
+    ↓
+[ready] → Response begins (streaming or complete)
+```
+
+#### Example: UI Loading Animation
+
+```python
+async def handle_thinking_state(tenant_id: str, state: str):
+    """Control UI loading animations based on processing state"""
+    
+    if state == 'thinking':
+        # Start loading animation
+        await send_websocket_message(tenant_id, {
+            "type": "status",
+            "state": "thinking",
+            "message": "Retrieving context and memories..."
+        })
+        # Show spinner, skeleton loader, etc.
+        
+    elif state == 'ready':
+        # Stop loading animation, prepare for content
+        await send_websocket_message(tenant_id, {
+            "type": "status", 
+            "state": "ready",
+            "message": "Processing complete"
+        })
+        # Hide spinner, prepare content area
+
+proxy = BrainProxy(
+    on_thinking=handle_thinking_state,
+    enable_memory=True
+)
+```
+
+#### Example: Performance Monitoring
+
+```python
+class PerformanceTracker:
+    def __init__(self):
+        self.timings = {}
+    
+    def track_state(self, tenant_id: str, state: str):
+        """Track processing time between states"""
+        import time
+        
+        if state == 'thinking':
+            self.timings[tenant_id] = time.time()
+            print(f"⏱️ [{tenant_id}] Memory retrieval started")
+            
+        elif state == 'ready':
+            if tenant_id in self.timings:
+                duration = time.time() - self.timings[tenant_id]
+                print(f"✅ [{tenant_id}] Ready in {duration:.2f}s")
+                # Log to monitoring service, metrics dashboard, etc.
+
+tracker = PerformanceTracker()
+proxy = BrainProxy(
+    on_thinking=tracker.track_state,
+    enable_memory=True
+)
+```
+
+#### Synchronous vs Asynchronous
+
+The callback supports both synchronous and asynchronous functions:
+
+```python
+# Synchronous callback
+def sync_callback(tenant_id: str, state: str):
+    if state == 'thinking':
+        logger.info(f"Thinking for {tenant_id}")
+    elif state == 'ready':
+        logger.info(f"Ready for {tenant_id}")
+
+# Asynchronous callback  
+async def async_callback(tenant_id: str, state: str):
+    if state == 'thinking':
+        await async_operation(tenant_id, "thinking")
+    elif state == 'ready':
+        await async_operation(tenant_id, "ready")
+
+# Both work seamlessly
+proxy = BrainProxy(on_thinking=sync_callback)  # or async_callback
+```
+
+#### Key Benefits
+
+- **Improved UX**: Users see immediate feedback that their request is being processed
+- **Streaming Support**: Works identically for both streaming and non-streaming responses
+- **Error Resilient**: Callback errors are caught and logged without breaking the main flow
+- **Lightweight**: Minimal overhead, called only twice per request
+- **Flexible**: Use for animations, monitoring, logging, or any custom state management
 
 ---
 
