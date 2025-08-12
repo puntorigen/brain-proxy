@@ -19,6 +19,80 @@
 - ✅ Real-time processing feedback via `on_thinking` callback
 - ✅ No frontend changes required
 - ✅ **Now uses LiteLLM by default — specify any model using `provider/model` (e.g., `openai/gpt-4o`, `cerebras/llama3-70b-instruct`)**
+- ✅ **NEW: Ephemeral Session Memory** — Separate persistent tenant knowledge from temporary user sessions
+
+---
+
+## 🆕 Ephemeral Session Memory
+
+Brain-proxy now supports **ephemeral session memory**, perfect for customer support, chat applications, and multi-user scenarios where you need:
+- **Persistent tenant knowledge** (company info, policies, products) 
+- **Temporary session context** (individual user conversations)
+
+### How It Works
+
+Use a colon `:` separator in your tenant ID to create a session:
+
+```python
+# Base tenant only (persistent memory)
+/v1/acme/chat/completions
+
+# Tenant with session (persistent + ephemeral)
+/v1/acme:+15551234567/chat/completions      # Phone support
+/v1/acme:user@email.com/chat/completions     # Email support
+/v1/acme:chat_session_123/chat/completions   # Web chat
+```
+
+### Key Features
+
+- **Session Persistence**: Sessions remain active within TTL (default 24 hours)
+- **Memory Overflow Protection**: Automatic summarization prevents unbounded growth
+- **File Upload Blocking**: Sessions cannot upload files (security feature)
+- **Session Callbacks**: Extract insights when sessions end
+- **Intelligent Memory Retrieval**: Combines base knowledge with session context
+
+### Example Usage
+
+```python
+from brain_proxy import BrainProxy
+
+async def on_session_end(tenant_id: str, session_data: dict):
+    """Called when a session expires."""
+    print(f"Session {tenant_id} ended with {session_data['message_count']} messages")
+    # Extract valuable insights, store feedback, etc.
+
+proxy = BrainProxy(
+    default_model="openai/gpt-4o-mini",
+    enable_session_memory=True,  # Enable ephemeral sessions
+    session_ttl_hours=24,         # Session lifetime
+    session_max_messages=100,     # Max messages before summarization
+    on_session_end=on_session_end # Callback for session cleanup
+)
+```
+
+### Customer Support Example
+
+```python
+import openai
+
+# Configure for your tenant with session
+openai.api_base = "http://localhost:8000/v1/support:+15551234567"
+
+# First interaction - creates new session
+response1 = openai.ChatCompletion.create(
+    model="gpt-4",
+    messages=[{"role": "user", "content": "I need help with my order #12345"}]
+)
+
+# Later in conversation - session context preserved
+response2 = openai.ChatCompletion.create(
+    model="gpt-4", 
+    messages=[{"role": "user", "content": "What about the issue I mentioned?"}]
+)
+# The AI remembers the order number from earlier!
+```
+
+See [examples/ephemeral_session_example.py](examples/ephemeral_session_example.py) for a complete demonstration.
 
 ---
 
@@ -90,6 +164,14 @@ BrainProxy(
     extract_text=None,  # Custom text extraction function for files
     system_prompt=None,  # Optional global system prompt for all conversations
     temporal_awareness=True,  # Enable time-based memory filtering for temporal queries
+    
+    # Session management (NEW)
+    enable_session_memory=True,  # Enable ephemeral session support
+    session_ttl_hours=24,  # Session lifetime in hours
+    session_max_messages=100,  # Max messages before forced summarization
+    session_summarize_after=50,  # Trigger summarization after N messages
+    session_memory_max_mb=10.0,  # Max memory usage per session
+    on_session_end=None,  # Callback when session expires (tenant_id, session_data)
     
     # Hooks
     manager_fn=None,  # Multi-agent manager hook

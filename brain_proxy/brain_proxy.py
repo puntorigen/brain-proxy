@@ -25,8 +25,8 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_litellm import ChatLiteLLM
 from .temporal_utils import extract_timerange
-from .upstash_adapter import upstash_vec_factory
-from .chroma_adapter import chroma_vec_factory
+from .upstash_adapter import upstash_vec_factory, UpstashAsyncWrapper as UpstashVectorStore
+from .chroma_adapter import chroma_vec_factory, ChromaAsyncWrapper
 #import litellm
 #litellm._turn_on_debug()
 
@@ -36,6 +36,142 @@ class Memory(BaseModel):
 
 # LangMem primitives (functions, not classes)
 from langmem import create_memory_manager
+
+# -------------------------------------------------------------------
+# Session Memory Manager for ephemeral sessions
+# -------------------------------------------------------------------
+class SessionMemoryManager:
+    """Manages ephemeral session memories with intelligent summarization."""
+    
+    def __init__(
+        self, 
+        tenant_id: str,
+        memory_model: str,
+        max_recent: int = 30,
+        summarize_after: int = 50,
+        max_memory_mb: float = 10.0
+    ):
+        self.tenant_id = tenant_id
+        self.memory_model = memory_model
+        self.max_recent = max_recent
+        self.summarize_after = summarize_after
+        self.max_memory_mb = max_memory_mb
+        
+        self.memories: List[Dict[str, Any]] = []
+        self.summaries: List[Dict[str, Any]] = []
+        self.created_at = datetime.now(timezone.utc)
+        self.last_accessed = datetime.now(timezone.utc)
+        self.message_count = 0
+        
+    def update_access_time(self):
+        """Update the last accessed time for TTL management."""
+        self.last_accessed = datetime.now(timezone.utc)
+        
+    async def add_memory(self, content: str, role: str = "user") -> None:
+        """Add a new memory and trigger summarization if needed."""
+        self.memories.append({
+            "content": content,
+            "role": role,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+        self.message_count += 1
+        self.update_access_time()
+        
+        # Trigger summarization if we exceed the threshold
+        if len(self.memories) > self.summarize_after:
+            await self._summarize_old_memories()
+            
+    async def _summarize_old_memories(self) -> None:
+        """Summarize older memories to prevent overflow."""
+        if len(self.memories) <= self.max_recent:
+            return
+            
+        # Get memories to summarize (all except the most recent ones)
+        to_summarize = self.memories[:-self.max_recent]
+        
+        # Group by hour for summarization
+        hourly_groups = {}
+        for mem in to_summarize:
+            timestamp = datetime.fromisoformat(mem["timestamp"])
+            hour_key = timestamp.strftime("%Y-%m-%d %H:00")
+            
+            if hour_key not in hourly_groups:
+                hourly_groups[hour_key] = []
+            hourly_groups[hour_key].append(mem)
+            
+        # Create summaries using the memory model
+        from litellm import acompletion
+        
+        for hour_key, memories in hourly_groups.items():
+            # Build conversation for summarization
+            messages_text = "\n".join([
+                f"{m['role']}: {m['content']}" for m in memories
+            ])
+            
+            summary_prompt = f"""Summarize this conversation segment concisely, preserving key facts, decisions, and context:
+
+{messages_text}
+
+Provide a brief summary (2-3 sentences) capturing the essential information."""
+
+            try:
+                response = await acompletion(
+                    model=self.memory_model,
+                    messages=[{"role": "user", "content": summary_prompt}],
+                    max_tokens=200
+                )
+                
+                summary_content = response.choices[0].message.content
+                
+                self.summaries.append({
+                    "summary": summary_content,
+                    "period": hour_key,
+                    "message_count": len(memories),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+            except Exception as e:
+                # Fall back to simple concatenation if summarization fails
+                self.summaries.append({
+                    "summary": f"[{len(memories)} messages from {hour_key}]",
+                    "period": hour_key,
+                    "message_count": len(memories),
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                })
+        
+        # Keep only recent memories
+        self.memories = self.memories[-self.max_recent:]
+        
+    def get_all_memories(self) -> List[str]:
+        """Get all memories including summaries for retrieval."""
+        result = []
+        
+        # Add summaries first (older context)
+        for summary in self.summaries:
+            result.append(f"[Summary from {summary['period']}]: {summary['summary']}")
+            
+        # Add recent memories
+        for mem in self.memories:
+            result.append(f"{mem['content']}")
+            
+        return result
+        
+    def get_session_data(self) -> Dict[str, Any]:
+        """Get all session data for the on_session_end callback."""
+        return {
+            "tenant_id": self.tenant_id,
+            "messages": self.memories.copy(),
+            "summaries": self.summaries.copy(),
+            "created_at": self.created_at.isoformat(),
+            "last_accessed": self.last_accessed.isoformat(),
+            "message_count": self.message_count
+        }
+        
+    def estimate_memory_usage(self) -> float:
+        """Estimate memory usage in MB."""
+        import sys
+        total_size = sys.getsizeof(self.memories) + sys.getsizeof(self.summaries)
+        return total_size / (1024 * 1024)
+
 
 _MEMORY_INSTRUCTIONS = """
 You are a long-term memory manager that maintains semantic, procedural, and episodic memories
@@ -253,6 +389,13 @@ class BrainProxy:
         upstash_rest_url: Optional[str] = None,
         upstash_rest_token: Optional[str] = None,
         max_workers: int = 10,
+        # Session management settings
+        enable_session_memory: bool = True,
+        session_ttl_hours: int = 24,
+        session_max_messages: int = 100,
+        session_summarize_after: int = 50,
+        session_memory_max_mb: float = 10.0,
+        on_session_end: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     ):
         # Initialize basic attributes first
         self.storage_dir = Path(storage_dir)
@@ -294,6 +437,16 @@ class BrainProxy:
         self.debug = debug
         self.upstash_rest_url = upstash_rest_url
         self.upstash_rest_token = upstash_rest_token
+        
+        # Initialize session management attributes
+        self.enable_session_memory = enable_session_memory
+        self.session_ttl_hours = session_ttl_hours
+        self.session_max_messages = session_max_messages
+        self.session_summarize_after = session_summarize_after
+        self.session_memory_max_mb = session_memory_max_mb
+        self.on_session_end = on_session_end
+        self._session_memories: Dict[str, SessionMemoryManager] = {}
+        self._session_ttl: Dict[str, datetime] = {}
 
         # Initialize embeddings using litellm's synchronous embedding function
         underlying_embeddings = LiteLLMEmbeddings(model=self.embedding_model)
@@ -335,13 +488,97 @@ class BrainProxy:
     # ----------------------------------------------------------------
     # Memory helpers
     # ----------------------------------------------------------------
+    def _parse_tenant_session(self, tenant: str) -> Tuple[str, Optional[str]]:
+        """Parse tenant ID into base tenant and optional session ID.
+        
+        Args:
+            tenant: Full tenant ID (e.g., "tenant1" or "tenant1:session_id")
+            
+        Returns:
+            Tuple of (base_tenant, session_id) where session_id is None if no session
+        """
+        if ':' in tenant and self.enable_session_memory:
+            parts = tenant.split(':', 1)
+            base_tenant = parts[0]
+            session_id = parts[1]
+            
+            # Validate session ID to prevent injection
+            if not re.match(r'^[\w\+\-\.\@]+$', session_id):
+                raise ValueError(f"Invalid session ID format: {session_id}")
+                
+            return base_tenant, session_id
+        return tenant, None
+    
+    # ----------------------------------------------------------------
+    async def _get_or_create_session(self, full_tenant_id: str) -> SessionMemoryManager:
+        """Get existing session or create new one, with TTL refresh."""
+        now = datetime.now(timezone.utc)
+        
+        # Check for expired sessions and clean them up
+        await self._cleanup_expired_sessions()
+        
+        if full_tenant_id in self._session_memories:
+            # Session exists - refresh TTL
+            self._session_ttl[full_tenant_id] = now
+            session = self._session_memories[full_tenant_id]
+            session.update_access_time()
+            return session
+        
+        # Create new session
+        session = SessionMemoryManager(
+            tenant_id=full_tenant_id,
+            memory_model=self.memory_model,
+            max_recent=self.session_max_messages // 3,  # Keep 1/3 as recent
+            summarize_after=self.session_summarize_after,
+            max_memory_mb=self.session_memory_max_mb
+        )
+        
+        self._session_memories[full_tenant_id] = session
+        self._session_ttl[full_tenant_id] = now
+        return session
+    
+    # ----------------------------------------------------------------
+    async def _cleanup_expired_sessions(self):
+        """Clean up sessions that have exceeded TTL."""
+        now = datetime.now(timezone.utc)
+        ttl_delta = timedelta(hours=self.session_ttl_hours)
+        
+        expired_sessions = []
+        for tenant_id, last_access in self._session_ttl.items():
+            if now - last_access > ttl_delta:
+                expired_sessions.append(tenant_id)
+        
+        for tenant_id in expired_sessions:
+            session = self._session_memories.get(tenant_id)
+            if session and self.on_session_end:
+                # Call the on_session_end callback
+                try:
+                    await _maybe(self.on_session_end, tenant_id, session.get_session_data())
+                except Exception as e:
+                    self._log(f"Error in on_session_end callback: {e}")
+            
+            # Clean up the session
+            if tenant_id in self._session_memories:
+                del self._session_memories[tenant_id]
+            if tenant_id in self._session_ttl:
+                del self._session_ttl[tenant_id]
+                
+            self._log(f"Cleaned up expired session: {tenant_id}")
+    
+    # ----------------------------------------------------------------
     def _get_mem_manager(self, tenant: str):
         """Get or create memory manager for tenant"""
-        if tenant in self._mem_managers:
-            return self._mem_managers[tenant]
+        # For sessions, we need to use the base tenant's memory manager
+        base_tenant, session_id = self._parse_tenant_session(tenant)
+        
+        # Use base tenant for persistent memories
+        mem_key = base_tenant
+        
+        if mem_key in self._mem_managers:
+            return self._mem_managers[mem_key]
 
-        # use the tenant's chroma collection for memory as well
-        vec = self.vec_factory(f"{tenant}_memory")
+        # use the base tenant's chroma collection for memory as well
+        vec = self.vec_factory(f"{mem_key}_memory")
         async def _search_mem(query: str, k: int):
             docs = await vec.similarity_search(query, k=k)
             return [d.page_content for d in docs]
@@ -376,7 +613,7 @@ class BrainProxy:
                     self._log(f"Error processing memory: {e}")
             
             if docs:
-                self._log(f"Storing {len(docs)} memories for tenant {tenant}")
+                self._log(f"Storing {len(docs)} memories for tenant {mem_key}")
                 await vec.add_documents(docs)
                 self._log(f"Successfully stored memories")
 
@@ -384,8 +621,8 @@ class BrainProxy:
         # No wrapper to avoid potential deadlocks
         manager = create_memory_manager(ChatLiteLLM(model=self.memory_model), instructions=_MEMORY_INSTRUCTIONS)
         
-        self._mem_managers[tenant] = (manager, _search_mem, _store_mem)
-        return self._mem_managers[tenant]
+        self._mem_managers[mem_key] = (manager, _search_mem, _store_mem)
+        return self._mem_managers[mem_key]
 
     async def _retrieve_memories(self, tenant: str, user_text: str) -> str:
         """Return a '\n'-joined block of relevant memories (filtered by time if possible)."""
@@ -393,10 +630,13 @@ class BrainProxy:
             self._log(f"Memory disabled for tenant {tenant}")
             return ""
 
-        # Get tenant-specific memories
-        mgr, search, _ = self._get_mem_manager(tenant)
+        # Parse tenant to check for session
+        base_tenant, session_id = self._parse_tenant_session(tenant)
+        
+        # Get base tenant memories
+        mgr, search, _ = self._get_mem_manager(tenant)  # Uses base_tenant internally
         if not mgr:
-            self._log(f"No memory manager found for tenant {tenant}")
+            self._log(f"No memory manager found for tenant {base_tenant}")
             return ""
 
         # 1️⃣  broad search in parallel
@@ -411,9 +651,21 @@ class BrainProxy:
         
         # Gather results from all searches
         results = await asyncio.gather(*search_tasks)
-        raw.extend(results[0])  # Tenant-specific memories
+        raw.extend(results[0])  # Base tenant memories
         if self.enable_global_memory and global_mgr:
             raw.extend(results[1])  # Global memories
+        
+        # Add session memories if we have a session
+        if session_id and self.enable_session_memory:
+            session = await self._get_or_create_session(tenant)
+            session_memories = session.get_all_memories()
+            
+            # Add session memories with priority (they're more recent/relevant)
+            for mem in session_memories:
+                # Add a marker to distinguish session memories
+                raw.insert(0, f"[SESSION] {mem}")
+            
+            self._log(f"Added {len(session_memories)} session memories for {tenant}")
 
         # 2️⃣  try to detect a date / relative phrase
         timerange = extract_timerange(user_text) if self.temporal_awareness else None
@@ -454,10 +706,39 @@ class BrainProxy:
         self, tenant: str, conversation: List[Dict[str, Any]]
     ):
         """Process and store memories in the background."""
-        manager_tuple = self._get_mem_manager(tenant)
-        if not manager_tuple:
-            return
-        manager, _, store = manager_tuple
+        # Parse tenant to check for session
+        base_tenant, session_id = self._parse_tenant_session(tenant)
+        
+        # Handle session memories if we have a session
+        if session_id and self.enable_session_memory:
+            try:
+                session = await self._get_or_create_session(tenant)
+                
+                # Store recent conversation in session memory
+                for msg in conversation:
+                    if isinstance(msg, dict):
+                        role = msg.get("role", "user")
+                        content = msg.get("content", "")
+                        if content:
+                            await session.add_memory(content, role)
+                
+                self._log(f"Stored {len(conversation)} messages in session memory for {tenant}")
+                
+                # Check if session memory usage is too high
+                if session.estimate_memory_usage() > self.session_memory_max_mb:
+                    self._log(f"Session memory usage high for {tenant}, triggering summarization")
+                    await session._summarize_old_memories()
+                    
+            except Exception as e:
+                self._log(f"Error storing session memories: {e}")
+        
+        # Also process persistent memories for base tenant (not for pure sessions)
+        # Only store significant information in persistent memory
+        if not session_id or len(conversation) > 5:  # Threshold for significance
+            manager_tuple = self._get_mem_manager(tenant)  # Uses base_tenant internally
+            if not manager_tuple:
+                return
+            manager, _, store = manager_tuple
         
         try:
             # Get memories from the manager
@@ -623,10 +904,21 @@ class BrainProxy:
         """Ingest files into vector store. Handles both raw text and pre-processed Documents."""
         if not files:
             return
+            
+        # Check if this is an ephemeral session
+        base_tenant, session_id = self._parse_tenant_session(tenant)
+        
+        if session_id is not None:
+            # Block file uploads for ephemeral sessions
+            raise HTTPException(
+                status_code=400,
+                detail="File uploads are not allowed for ephemeral sessions. Please use the base tenant endpoint for file uploads."
+            )
+        
         docs = []
         
-        # Create tenant directory if it doesn't exist
-        tenant_dir = Path(f"{self.storage_dir}/{tenant}/files")
+        # Create tenant directory if it doesn't exist (use base_tenant for safety)
+        tenant_dir = Path(f"{self.storage_dir}/{base_tenant}/files")
         tenant_dir.mkdir(exist_ok=True, parents=True)
         
         for file in files:
@@ -673,7 +965,7 @@ class BrainProxy:
                 self._log(f"Error ingesting file: {e}")
 
         if docs:
-            vec = self.vec_factory(tenant)
+            vec = self.vec_factory(base_tenant)  # Use base_tenant for file storage
             await vec.add_documents(docs)
 
     # ----------------------------------------------------------------
@@ -683,7 +975,10 @@ class BrainProxy:
         """Retrieve info from vector store and inject it into the conversation"""
         if len(msgs) == 0:
             return msgs
-        vec = self.vec_factory(tenant)
+        
+        # Use base tenant for document retrieval
+        base_tenant, _ = self._parse_tenant_session(tenant)
+        vec = self.vec_factory(base_tenant)
 
         # get query from last message
         query = msgs[-1]["content"] if isinstance(msgs[-1]["content"], str) else ""
