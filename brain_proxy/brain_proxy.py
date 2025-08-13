@@ -1643,6 +1643,25 @@ class BrainProxy:
                                 "content": f"Error executing tool: {str(e)}"
                             })
 
+                # Stream tool results to client
+                for tool_result in tool_results:
+                    tool_payload = {
+                        "id": f"chatcmpl-{time.time()}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": req.model or self.default_model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": f"\n\nTool '{tool_result['name']}' response: {tool_result['content']}"
+                            },
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {json.dumps(tool_payload)}\n\n"
+                    buf.append(f"\n\nTool '{tool_result['name']}' response: {tool_result['content']}")
+
                 followup_msgs = self._prune_msgs_for_tool_followup(original_msgs) + [
                     {
                         "role": "assistant",
@@ -1654,64 +1673,77 @@ class BrainProxy:
 
                 # TODO: send the tools here as well if they're defined; or refactor to make the calls in a loop
                 # Recursive follow-up loop after first tool call
+                self._log(f"🔄 Starting tool follow-up streaming for tenant {tenant}")
                 while True:
-                    filtered_tools = await self._filter_tools_via_llm(followup_msgs, final_tools)
-                    if filtered_tools:
-                        self._log(f"➡️  Enviando {len(filtered_tools)} of {len(final_tools)} tools ...")
-                    followup_iter = await _safe_acompletion(
-                        model=req.model or self.default_model,
-                        messages=followup_msgs,
-                        stream=True,
-                        tools=filtered_tools,
-                        tool_choice="auto"
-                    )
+                    try:
+                        filtered_tools = await self._filter_tools_via_llm(followup_msgs, final_tools)
+                        if filtered_tools:
+                            self._log(f"➡️  Enviando {len(filtered_tools)} of {len(final_tools)} tools ...")
+                        self._log(f"🚀 Starting follow-up acompletion call")
+                        followup_iter = await _safe_acompletion(
+                            model=req.model or self.default_model,
+                            messages=followup_msgs,
+                            stream=True,
+                            tools=filtered_tools,
+                            tool_choice="auto"
+                        )
+                        self._log(f"✅ Follow-up acompletion successful, starting chunk processing")
+                    except Exception as e:
+                        self._log(f"❌ Error in tool follow-up setup: {e}")
+                        break
 
                     tool_calls_detected = False
                     tool_call_parts = {}
                     current_call_idx = None
 
-                    async for chunk in followup_iter:
-                        payload = json.loads(chunk.model_dump_json())
-                        choice = payload["choices"][0]
-                        delta = choice.get("delta", {})
+                    try:
+                        async for chunk in followup_iter:
+                            payload = await _process_chunk_payload(chunk)
+                            choice = payload["choices"][0]
+                            delta = choice.get("delta", {})
 
-                        # Handle streaming content
-                        if "content" in delta:
-                            content = delta.get("content", "")
-                            buf.append(content or "")
-                            tokens += len(content or "")
-                        yield f"data: {json.dumps(payload)}\n\n"
-
-                        # Detect additional tool calls
-                        for tc in (delta.get("tool_calls", []) or []):
-                            tool_calls_detected = True
-                            idx = tc.get("index", current_call_idx)
-                            current_call_idx = idx
-                            if idx is None:
-                                continue
-
-                            accum = tool_call_parts.get(idx, {
-                                "id": tc.get("id"),
-                                "type": "function",
-                                "function": {"name": None, "arguments": ""},
-                                "index": idx
-                            })
-
-                            fn = accum["function"]
-                            upd_fn = tc.get("function", {})
-                            if "name" in upd_fn and not fn["name"]:
-                                fn["name"] = upd_fn["name"]
-                            if "arguments" in upd_fn:
-                                fn["arguments"] += upd_fn["arguments"]
-                            if tc.get("id"):
-                                accum["id"] = tc["id"]
-                            tool_call_parts[idx] = accum
+                            # Handle streaming content
+                            if "content" in delta:
+                                content = delta.get("content", "")
+                                buf.append(content or "")
+                                tokens += len(content or "")
                             yield f"data: {json.dumps(payload)}\n\n"
 
-                        if choice.get("finish_reason") == "tool_calls":
-                            break
+                            # Detect additional tool calls
+                            for tc in (delta.get("tool_calls", []) or []):
+                                tool_calls_detected = True
+                                idx = tc.get("index", current_call_idx)
+                                current_call_idx = idx
+                                if idx is None:
+                                    continue
+
+                                accum = tool_call_parts.get(idx, {
+                                    "id": tc.get("id"),
+                                    "type": "function",
+                                    "function": {"name": None, "arguments": ""},
+                                    "index": idx
+                                })
+
+                                fn = accum["function"]
+                                upd_fn = tc.get("function", {})
+                                if "name" in upd_fn and not fn["name"]:
+                                    fn["name"] = upd_fn["name"]
+                                if "arguments" in upd_fn:
+                                    fn["arguments"] += upd_fn["arguments"]
+                                if tc.get("id"):
+                                    accum["id"] = tc["id"]
+                                tool_call_parts[idx] = accum
+                                yield f"data: {json.dumps(payload)}\n\n"
+
+                            if choice.get("finish_reason") == "tool_calls":
+                                break
+                                
+                    except Exception as e:
+                        self._log(f"❌ Error in tool follow-up streaming: {e}")
+                        break
 
                     if not tool_calls_detected:
+                        self._log(f"✅ No more tool calls detected, completing follow-up for tenant {tenant}")
                         break
 
                     # Execute new tool calls
@@ -1762,6 +1794,25 @@ class BrainProxy:
                                     "name": name,
                                     "content": f"Error executing tool: {str(e)}"
                                 })
+
+                    # Stream new tool results to client
+                    for tool_result in new_tool_results:
+                        tool_payload = {
+                            "id": f"chatcmpl-{time.time()}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": req.model or self.default_model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "role": "assistant",
+                                    "content": f"\n\nTool '{tool_result['name']}' response: {tool_result['content']}"
+                                },
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(tool_payload)}\n\n"
+                        buf.append(f"\n\nTool '{tool_result['name']}' response: {tool_result['content']}")
 
                     followup_msgs = self._prune_msgs_for_tool_followup(followup_msgs) + [
                         {
