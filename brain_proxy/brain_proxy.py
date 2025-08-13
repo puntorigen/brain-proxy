@@ -115,7 +115,7 @@ class SessionMemoryManager:
 Provide a brief summary (2-3 sentences) capturing the essential information."""
 
             try:
-                response = await acompletion(
+                response = await _safe_acompletion(
                     model=self.memory_model,
                     messages=[{"role": "user", "content": summary_prompt}],
                     max_tokens=200
@@ -260,6 +260,43 @@ def _sha(b: bytes) -> str:
 
 async def _maybe(fn, *a, **k):
     return await fn(*a, **k) if asyncio.iscoroutinefunction(fn) else fn(*a, **k)
+
+
+async def _safe_acompletion(**kwargs):
+    """
+    Wrapper for acompletion with basic retry logic for production stability.
+    Only retries on clearly transient errors.
+    """
+    max_retries = 2  # Conservative retry count
+    
+    for attempt in range(max_retries + 1):
+        try:
+            return await acompletion(**kwargs)
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            # Only retry on clearly transient errors
+            is_retryable = any(pattern in error_str for pattern in [
+                'rate limit', 'timeout', 'connection', 'server error', 
+                '429', '500', '502', '503', '504'
+            ])
+            
+            # Don't retry on permanent errors
+            is_permanent = any(pattern in error_str for pattern in [
+                'invalid_request_error', 'authentication_error', 
+                'permission_denied', 'invalid_api_key', 'model_not_found'
+            ])
+            
+            if is_permanent or attempt >= max_retries:
+                raise e
+                
+            if is_retryable and attempt < max_retries:
+                delay = 1.0 * (2 ** attempt)  # 1s, 2s
+                print(f"LLM call failed (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                print(f"Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+            else:
+                raise e
 
 
 # -------------------------------------------------------------------
@@ -514,8 +551,10 @@ class BrainProxy:
         """Get existing session or create new one, with TTL refresh."""
         now = datetime.now(timezone.utc)
         
-        # Check for expired sessions and clean them up
-        await self._cleanup_expired_sessions()
+        # Only cleanup expired sessions occasionally to avoid blocking every request
+        if not hasattr(self, '_last_cleanup') or (now - self._last_cleanup).total_seconds() > 300:  # 5 minutes
+            self._last_cleanup = now
+            asyncio.create_task(self._cleanup_expired_sessions())
         
         if full_tenant_id in self._session_memories:
             # Session exists - refresh TTL
@@ -550,20 +589,25 @@ class BrainProxy:
         
         for tenant_id in expired_sessions:
             session = self._session_memories.get(tenant_id)
-            if session and self.on_session_end:
-                # Call the on_session_end callback
-                try:
-                    await _maybe(self.on_session_end, tenant_id, session.get_session_data())
-                except Exception as e:
-                    self._log(f"Error in on_session_end callback: {e}")
             
-            # Clean up the session
+            # Clean up the session immediately
             if tenant_id in self._session_memories:
                 del self._session_memories[tenant_id]
             if tenant_id in self._session_ttl:
                 del self._session_ttl[tenant_id]
                 
             self._log(f"Cleaned up expired session: {tenant_id}")
+            
+            # Call the on_session_end callback in background to avoid blocking
+            if session and self.on_session_end:
+                asyncio.create_task(self._call_session_end_callback(tenant_id, session))
+    
+    async def _call_session_end_callback(self, tenant_id: str, session):
+        """Call the on_session_end callback in background."""
+        try:
+            await _maybe(self.on_session_end, tenant_id, session.get_session_data())
+        except Exception as e:
+            self._log(f"Error in on_session_end callback: {e}")
     
     # ----------------------------------------------------------------
     def _get_mem_manager(self, tenant: str):
@@ -1059,7 +1103,7 @@ class BrainProxy:
     {{"selected_tools": ["tool_name1", "tool_name2"]}}"""
 
         # 4. Run LLM call
-        response = await acompletion(
+        response = await _safe_acompletion(
             model=self.tool_filtering_model or "gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You only reply with a JSON object listing selected tools."},
@@ -1135,7 +1179,7 @@ class BrainProxy:
 
         kwargs["messages"] = msgs
         self._log(f"➡️  Enviando kwargs: {kwargs}")
-        response = await acompletion(**kwargs)
+        response = await _safe_acompletion(**kwargs)
         
         # Process tool calls if present
         if not stream and hasattr(response.choices[0], "message") and hasattr(response.choices[0].message, "tool_calls") and response.choices[0].message.tool_calls:
@@ -1216,7 +1260,7 @@ class BrainProxy:
                 kwargs["messages"] = new_msgs
                 kwargs.pop("tools", None)  # Remove tools to prevent infinite loops
                 kwargs.pop("tool_choice", None)
-                response = await acompletion(**kwargs)
+                response = await _safe_acompletion(**kwargs)
                 
         return response
         
@@ -1614,7 +1658,7 @@ class BrainProxy:
                     filtered_tools = await self._filter_tools_via_llm(followup_msgs, final_tools)
                     if filtered_tools:
                         self._log(f"➡️  Enviando {len(filtered_tools)} of {len(final_tools)} tools ...")
-                    followup_iter = await acompletion(
+                    followup_iter = await _safe_acompletion(
                         model=req.model or self.default_model,
                         messages=followup_msgs,
                         stream=True,
