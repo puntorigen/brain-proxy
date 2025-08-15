@@ -1643,24 +1643,7 @@ class BrainProxy:
                                 "content": f"Error executing tool: {str(e)}"
                             })
 
-                # Stream tool results to client
-                for tool_result in tool_results:
-                    tool_payload = {
-                        "id": f"chatcmpl-{time.time()}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": req.model or self.default_model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "role": "assistant",
-                                "content": f"\n\nTool '{tool_result['name']}' response: {tool_result['content']}"
-                            },
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(tool_payload)}\n\n"
-                    buf.append(f"\n\nTool '{tool_result['name']}' response: {tool_result['content']}")
+
 
                 followup_msgs = self._prune_msgs_for_tool_followup(original_msgs) + [
                     {
@@ -1795,24 +1778,7 @@ class BrainProxy:
                                     "content": f"Error executing tool: {str(e)}"
                                 })
 
-                    # Stream new tool results to client
-                    for tool_result in new_tool_results:
-                        tool_payload = {
-                            "id": f"chatcmpl-{time.time()}",
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": req.model or self.default_model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "role": "assistant",
-                                    "content": f"\n\nTool '{tool_result['name']}' response: {tool_result['content']}"
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(tool_payload)}\n\n"
-                        buf.append(f"\n\nTool '{tool_result['name']}' response: {tool_result['content']}")
+
 
                     followup_msgs = self._prune_msgs_for_tool_followup(followup_msgs) + [
                         {
