@@ -38,6 +38,60 @@ class Memory(BaseModel):
 from langmem import create_memory_manager
 
 # -------------------------------------------------------------------
+# Safe ChatLiteLLM Wrapper to handle response format issues
+# -------------------------------------------------------------------
+class SafeChatLiteLLM(ChatLiteLLM):
+    """Wrapper for ChatLiteLLM that handles missing 'choices' field gracefully."""
+    
+    def __init__(self, *args, **kwargs):
+        """Initialize with logprobs=True to fix litellm response format issues."""
+        # Add logprobs=True to fix litellm bug with missing 'choices' field
+        # Only for OpenAI models as other providers don't support logprobs
+        if 'logprobs' not in kwargs and 'model' in kwargs:
+            model = kwargs.get('model', '')
+            if model.startswith('openai/') or model.startswith('gpt-'):
+                kwargs['logprobs'] = True
+        super().__init__(*args, **kwargs)
+    
+    def _create_chat_result(self, response):
+        """Override to handle missing 'choices' field in response."""
+        try:
+            # Try the normal path first
+            return super()._create_chat_result(response)
+        except KeyError as e:
+            if 'choices' in str(e):
+                # Handle the case where 'choices' is missing
+                # This might happen with error responses or unexpected formats
+                import warnings
+                warnings.warn(f"LLM response missing 'choices' field. Response keys: {response.keys() if isinstance(response, dict) else 'not a dict'}")
+                
+                # Create a minimal valid response structure
+                from langchain_core.outputs import ChatResult, ChatGeneration
+                from langchain_core.messages import AIMessage
+                
+                # Try to extract any useful information from the response
+                content = "Memory extraction failed due to LLM response format issue."
+                if isinstance(response, dict):
+                    # Try to get error message or any content
+                    content = response.get('error', {}).get('message', content) if 'error' in response else content
+                    content = response.get('message', content)
+                    content = response.get('content', content)
+                
+                # Create a minimal chat result
+                return ChatResult(
+                    generations=[
+                        ChatGeneration(
+                            message=AIMessage(content=content),
+                            generation_info=response if isinstance(response, dict) else {}
+                        )
+                    ],
+                    llm_output=response if isinstance(response, dict) else {}
+                )
+            else:
+                # Re-raise if it's a different KeyError
+                raise
+
+# -------------------------------------------------------------------
 # Session Memory Manager for ephemeral sessions
 # -------------------------------------------------------------------
 class SessionMemoryManager:
@@ -268,6 +322,13 @@ async def _safe_acompletion(**kwargs):
     Only retries on clearly transient errors.
     """
     max_retries = 2  # Conservative retry count
+    
+    # Add logprobs=True to fix litellm response format issues
+    # Only for OpenAI models as other providers don't support logprobs
+    if 'logprobs' not in kwargs and 'model' in kwargs:
+        model = kwargs.get('model', '')
+        if model.startswith('openai/') or model.startswith('gpt-'):
+            kwargs['logprobs'] = True
     
     for attempt in range(max_retries + 1):
         try:
@@ -661,9 +722,9 @@ class BrainProxy:
                 await vec.add_documents(docs)
                 self._log(f"Successfully stored memories")
 
-        # Use langchain_litellm's ChatLiteLLM for memory manager directly
-        # No wrapper to avoid potential deadlocks
-        manager = create_memory_manager(ChatLiteLLM(model=self.memory_model), instructions=_MEMORY_INSTRUCTIONS)
+        # Use SafeChatLiteLLM wrapper for memory manager to handle response format issues
+        # This wrapper handles missing 'choices' field gracefully
+        manager = create_memory_manager(SafeChatLiteLLM(model=self.memory_model), instructions=_MEMORY_INSTRUCTIONS)
         
         self._mem_managers[mem_key] = (manager, _search_mem, _store_mem)
         return self._mem_managers[mem_key]
@@ -785,9 +846,34 @@ class BrainProxy:
             manager, _, store = manager_tuple
         
         try:
-            # Get memories from the manager
+            # Get memories from the manager with retry logic for LLM errors
             self._log(f"Extracting memories for tenant {tenant}")
-            raw_memories = await manager(conversation)
+            
+            max_retries = 3
+            retry_delay = 1.0
+            raw_memories = None
+            
+            for attempt in range(max_retries):
+                try:
+                    raw_memories = await manager(conversation)
+                    break  # Success, exit retry loop
+                except (KeyError, AttributeError) as e:
+                    # These errors often happen with malformed LLM responses
+                    if attempt < max_retries - 1:
+                        self._log(f"Memory extraction attempt {attempt + 1} failed with {type(e).__name__}: {e}. Retrying...")
+                        await asyncio.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                    else:
+                        self._log(f"Memory extraction failed after {max_retries} attempts: {e}")
+                        # Return early to avoid further processing
+                        return
+                except Exception as e:
+                    # For other exceptions, log and exit
+                    self._log(f"Unexpected error in memory extraction: {e}")
+                    return
+            
+            if raw_memories is None:
+                self._log("Memory extraction returned None")
+                return
             
             # Debug logging to understand the format
             self._log(f"Raw memory count: {len(raw_memories) if raw_memories else 0}")
@@ -1454,10 +1540,106 @@ class BrainProxy:
 
             async def _process_chunk_payload(chunk) -> dict:
                 """Process a chunk into a payload."""
+                # First, try direct attribute extraction to avoid MockValSer issues
                 try:
-                    return json.loads(chunk.model_dump_json())
-                except Exception:
-                    return chunk
+                    # Directly extract needed fields without any Pydantic serialization
+                    result = {
+                        "choices": [],
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": "unknown"
+                    }
+                    
+                    # Extract model name if available
+                    if hasattr(chunk, 'model'):
+                        result["model"] = str(chunk.model) if chunk.model else "unknown"
+                    
+                    # Extract created timestamp if available
+                    if hasattr(chunk, 'created'):
+                        result["created"] = int(chunk.created) if chunk.created else int(time.time())
+                    
+                    # Extract choices
+                    if hasattr(chunk, 'choices') and chunk.choices:
+                        for choice in chunk.choices:
+                            choice_data = {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": None
+                            }
+                            
+                            # Extract index
+                            if hasattr(choice, 'index'):
+                                choice_data["index"] = int(choice.index) if choice.index is not None else 0
+                            
+                            # Extract finish_reason
+                            if hasattr(choice, 'finish_reason'):
+                                choice_data["finish_reason"] = str(choice.finish_reason) if choice.finish_reason else None
+                            
+                            # Extract delta content and tool calls
+                            if hasattr(choice, 'delta') and choice.delta:
+                                delta = choice.delta
+                                
+                                # Extract content
+                                if hasattr(delta, 'content') and delta.content is not None:
+                                    choice_data["delta"]["content"] = str(delta.content)
+                                
+                                # Extract tool_calls
+                                if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                                    tool_calls_list = []
+                                    for tc in delta.tool_calls:
+                                        tc_data = {
+                                            "index": 0,
+                                            "id": None,
+                                            "type": "function",
+                                            "function": {"name": "", "arguments": ""}
+                                        }
+                                        
+                                        if hasattr(tc, 'index') and tc.index is not None:
+                                            tc_data["index"] = int(tc.index)
+                                        if hasattr(tc, 'id') and tc.id:
+                                            tc_data["id"] = str(tc.id)
+                                        if hasattr(tc, 'type') and tc.type:
+                                            tc_data["type"] = str(tc.type)
+                                        
+                                        if hasattr(tc, 'function') and tc.function:
+                                            fn = tc.function
+                                            if hasattr(fn, 'name') and fn.name:
+                                                tc_data["function"]["name"] = str(fn.name)
+                                            if hasattr(fn, 'arguments') and fn.arguments is not None:
+                                                tc_data["function"]["arguments"] = str(fn.arguments)
+                                        
+                                        tool_calls_list.append(tc_data)
+                                    
+                                    if tool_calls_list:
+                                        choice_data["delta"]["tool_calls"] = tool_calls_list
+                            
+                            result["choices"].append(choice_data)
+                    
+                    # Ensure we have at least one choice
+                    if not result["choices"]:
+                        result["choices"] = [{"index": 0, "delta": {}, "finish_reason": None}]
+                    
+                    return result
+                    
+                except Exception as extraction_error:
+                    # If direct extraction fails, try standard serialization as fallback
+                    self._log(f"Warning: Direct extraction failed: {extraction_error}")
+                    
+                    try:
+                        # Try standard model_dump_json
+                        return json.loads(chunk.model_dump_json())
+                    except Exception as e:
+                        self._log(f"Warning: model_dump_json failed: {e}")
+                        
+                        # Last resort: minimal valid response
+                        return {
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": "unknown"
+                        }
+
+
 
             async def _handle_content_delta(delta: dict, buf: List[str], tokens: int, payload: dict) -> tuple[List[str], int, str]:
                 """Handle content delta updates."""
@@ -1678,6 +1860,7 @@ class BrainProxy:
                     tool_calls_detected = False
                     tool_call_parts = {}
                     current_call_idx = None
+                    content_streamed = False
 
                     try:
                         async for chunk in followup_iter:
@@ -1686,11 +1869,12 @@ class BrainProxy:
                             delta = choice.get("delta", {})
 
                             # Handle streaming content
-                            if "content" in delta:
+                            if "content" in delta and delta["content"]:
                                 content = delta.get("content", "")
-                                buf.append(content or "")
-                                tokens += len(content or "")
-                            yield f"data: {json.dumps(payload)}\n\n"
+                                buf.append(content)
+                                tokens += len(content)
+                                content_streamed = True
+                                yield f"data: {json.dumps(payload)}\n\n"
 
                             # Detect additional tool calls
                             for tc in (delta.get("tool_calls", []) or []):
@@ -1718,15 +1902,29 @@ class BrainProxy:
                                 tool_call_parts[idx] = accum
                                 yield f"data: {json.dumps(payload)}\n\n"
 
-                            if choice.get("finish_reason") == "tool_calls":
-                                break
+                            # Check for finish reasons
+                            finish_reason = choice.get("finish_reason")
+                            if finish_reason:
+                                if finish_reason == "tool_calls":
+                                    break
+                                elif finish_reason in ["stop", "length"]:
+                                    # Yield final chunk with finish_reason
+                                    yield f"data: {json.dumps(payload)}\n\n"
+                                    content_streamed = True
+                                    break
                                 
                     except Exception as e:
                         self._log(f"❌ Error in tool follow-up streaming: {e}")
                         break
 
-                    if not tool_calls_detected:
-                        self._log(f"✅ No more tool calls detected, completing follow-up for tenant {tenant}")
+                    # If content was streamed and no tool calls, we're done
+                    if content_streamed and not tool_calls_detected:
+                        self._log(f"✅ Follow-up content streamed for tenant {tenant}")
+                        break
+                    
+                    # If no content and no tool calls, something might be wrong
+                    if not tool_calls_detected and not content_streamed:
+                        self._log(f"⚠️ No content or tool calls in follow-up for tenant {tenant}")
                         break
 
                     # Execute new tool calls

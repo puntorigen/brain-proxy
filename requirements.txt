@@ -1,7 +1,7 @@
 fastapi
 openai
 langchain-chroma
-langmem
+langmem>=0.0.29
 tiktoken
 pydantic
 langchain-openai
