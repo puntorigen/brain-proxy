@@ -1422,7 +1422,7 @@ class BrainProxy2:
                     "content": f"Error: {str(e)}"
                 })
         
-        # Stream follow-up response
+        # Stream follow-up response with recursive tool support
         followup_msgs = messages + [
             {
                 "role": "assistant",
@@ -1432,23 +1432,137 @@ class BrainProxy2:
             *tool_results
         ]
         
-        self._log(f"Making follow-up call after tool execution for tenant {tenant}")
+        # Recursive loop for handling additional tool calls in follow-up
+        max_iterations = 10  # Prevent infinite loops
+        iteration = 0
         
-        followup_iter = await safe_llm_call(
-            model=request.model or self.config.default_model,
-            messages=self._validate_messages(followup_msgs),
-            stream=True
-        )
-        
-        async for chunk in followup_iter:
-            payload = await self.streaming_service.process_chunk(chunk)
-            choice = payload["choices"][0]
-            delta = choice.get("delta", {})
+        while iteration < max_iterations:
+            iteration += 1
+            self._log(f"Making follow-up call after tool execution for tenant {tenant} (iteration {iteration})")
             
-            if "content" in delta and delta["content"]:
-                buf.append(delta["content"])
-                tokens += len(delta["content"])
-                yield f"data: {json.dumps(payload)}\n\n"
+            try:
+                followup_iter = await safe_llm_call(
+                    model=request.model or self.config.default_model,
+                    messages=self._validate_messages(followup_msgs),
+                    stream=True
+                )
+            except Exception as e:
+                self._log(f"Error in follow-up call: {e}")
+                yield f"data: {json.dumps({'choices': [{'delta': {'content': f'Error: {str(e)}'}, 'index': 0}]})}\n\n"
+                break
+            
+            additional_tool_calls = {}
+            content_streamed = False
+            
+            try:
+                async for chunk in followup_iter:
+                    payload = await self.streaming_service.process_chunk(chunk)
+                    choice = payload["choices"][0]
+                    delta = choice.get("delta", {})
+                    
+                    # Handle content streaming
+                    if "content" in delta and delta["content"]:
+                        buf.append(delta["content"])
+                        tokens += len(delta["content"])
+                        content_streamed = True
+                        yield f"data: {json.dumps(payload)}\n\n"
+                    
+                    # Check for additional tool calls
+                    for tc in (delta.get("tool_calls", []) or []):
+                        idx = tc.get("index", 0)
+                        if idx not in additional_tool_calls:
+                            additional_tool_calls[idx] = {
+                                "id": tc.get("id"),
+                                "type": "function",
+                                "function": {"name": None, "arguments": ""},
+                                "index": idx
+                            }
+                        
+                        accum = additional_tool_calls[idx]
+                        fn = accum["function"]
+                        upd_fn = tc.get("function", {})
+                        
+                        if "name" in upd_fn and not fn["name"]:
+                            fn["name"] = upd_fn["name"]
+                        if "arguments" in upd_fn:
+                            fn["arguments"] += upd_fn["arguments"]
+                        if tc.get("id"):
+                            accum["id"] = tc["id"]
+                        
+                        # Don't yield tool call chunks to client
+                        # yield f"data: {json.dumps(payload)}\n\n"
+                    
+                    # Check for finish reason
+                    finish_reason = choice.get("finish_reason")
+                    if finish_reason:
+                        if finish_reason == "tool_calls":
+                            self._log(f"Additional tool calls detected in follow-up")
+                            break
+                        elif finish_reason in ["stop", "length"]:
+                            # Normal completion
+                            if not content_streamed:
+                                # If no content was streamed, send an empty message
+                                yield f"data: {json.dumps({'choices': [{'delta': {'content': ''}, 'index': 0, 'finish_reason': finish_reason}]})}\n\n"
+                            break
+            except Exception as e:
+                self._log(f"Error streaming follow-up response: {e}")
+                yield f"data: {json.dumps({'choices': [{'delta': {'content': f'Error: {str(e)}'}, 'index': 0}]})}\n\n"
+                break
+            
+            # If no additional tool calls, we're done
+            if not additional_tool_calls:
+                break
+            
+            # Execute additional tool calls
+            self._log(f"Executing {len(additional_tool_calls)} additional tool calls")
+            new_tool_calls = list(additional_tool_calls.values())
+            new_tool_results = []
+            
+            for tool_call in new_tool_calls:
+                name = tool_call["function"]["name"]
+                args_str = tool_call["function"].get("arguments", "")
+                args = {}
+                
+                if args_str.strip():
+                    try:
+                        args = json.loads(args_str)
+                    except Exception as e:
+                        self._log(f"Error parsing additional tool args for {name}: {e}")
+                
+                try:
+                    is_local = name in local_tool_names
+                    
+                    if is_local and self.config.local_tools_handler:
+                        result = await maybe_await(
+                            self.config.local_tools_handler,
+                            tenant, name, args
+                        )
+                    else:
+                        result = await self.tool_service.execute(name, args)
+                    
+                    new_tool_results.append({
+                        "tool_call_id": tool_call["id"] or f"call_{len(new_tool_results)}",
+                        "role": "tool",
+                        "name": name,
+                        "content": str(result)
+                    })
+                except Exception as e:
+                    new_tool_results.append({
+                        "tool_call_id": tool_call["id"] or f"call_{len(new_tool_results)}",
+                        "role": "tool",
+                        "name": name,
+                        "content": f"Error: {str(e)}"
+                    })
+            
+            # Update messages for next iteration
+            followup_msgs = followup_msgs + [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": new_tool_calls
+                },
+                *new_tool_results
+            ]
         
         yield "data: [DONE]\n\n"
         
