@@ -1300,6 +1300,7 @@ class BrainProxy2:
         
         import uuid
         stream_id = str(uuid.uuid4())[:8]
+        chat_id = f"chatcmpl-{stream_id}"
         self._log(f"[{stream_id}] Starting stream for tenant {tenant}")
         
         # Trigger ready callback
@@ -1359,7 +1360,19 @@ class BrainProxy2:
                 if tc.get("id"):
                     accum["id"] = tc["id"]
                 
-                yield f"data: {json.dumps(payload)}\n\n"
+                # Send empty content chunks to keep the stream alive
+                # Don't send the actual tool call data as it confuses clients
+                keep_alive_chunk = {
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": ""},  # Empty content
+                        "finish_reason": None
+                    }],
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model or self.config.default_model
+                }
+                yield f"data: {json.dumps(keep_alive_chunk)}\n\n"
             
             # Store finish reason but DON'T BREAK - consume entire stream
             if choice.get("finish_reason"):
@@ -1367,6 +1380,18 @@ class BrainProxy2:
                 if finish_reason == "tool_calls":
                     self._log(f"Tool calls detected for tenant {tenant}: {len(tool_call_parts)} calls")
                     tool_calls_detected = True
+                    # Send a keep-alive chunk when tools are detected
+                    status_chunk = {
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": ""},
+                            "finish_reason": None
+                        }],
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model or self.config.default_model
+                    }
+                    yield f"data: {json.dumps(status_chunk)}\n\n"
         
         # Stream has been fully consumed - now handle based on finish reason
         if not tool_calls_detected:
@@ -1384,9 +1409,20 @@ class BrainProxy2:
         
         self._log(f"[{stream_id}] Stream fully consumed, now executing {len(tool_call_parts)} tool calls for tenant {tenant}")
         
-        # Send a keep-alive comment to maintain SSE connection
-        yield f": Executing {len(tool_call_parts)} tool(s)...\n\n"
-        await asyncio.sleep(0.001)  # Small delay to ensure client processes the keep-alive
+        # Send a proper data event to maintain SSE connection (not just a comment)
+        # This ensures the client knows the stream is still active
+        status_chunk = {
+            "choices": [{
+                "index": 0,
+                "delta": {"content": ""},  # Empty content to keep stream alive
+                "finish_reason": None
+            }],
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": request.model or self.config.default_model
+        }
+        yield f"data: {json.dumps(status_chunk)}\n\n"
+        await asyncio.sleep(0.001)  # Small delay to ensure client processes
         
         # Execute tool calls and stream follow-up
         tool_calls = list(tool_call_parts.values())
@@ -1405,16 +1441,45 @@ class BrainProxy2:
             
             self._log(f"Executing tool: {name} with args: {args}")
             
+            # Send a keep-alive before executing each tool
+            tool_status_chunk = {
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": ""},
+                    "finish_reason": None
+                }],
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model or self.config.default_model
+            }
+            yield f"data: {json.dumps(tool_status_chunk)}\n\n"
+            
             try:
                 # Check if this tool should be handled by local_tools_handler
                 is_local = name in local_tool_names
                 
                 if is_local and self.config.local_tools_handler:
                     self._log(f"Calling local_tools_handler for: {name}")
+                    # Send keep-alive during tool execution
+                    keep_alive = {
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": ""},
+                            "finish_reason": None
+                        }],
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model or self.config.default_model
+                    }
+                    yield f"data: {json.dumps(keep_alive)}\n\n"
+                    
                     result = await maybe_await(
                         self.config.local_tools_handler,
                         tenant, name, args
                     )
+                    
+                    # Send another keep-alive after tool completes
+                    yield f"data: {json.dumps(keep_alive)}\n\n"
                 else:
                     self._log(f"Calling tool_service.execute for: {name}")
                     result = await self.tool_service.execute(name, args)
@@ -1448,18 +1513,39 @@ class BrainProxy2:
         
         self._log(f"[{stream_id}] Making non-streaming follow-up call after tool execution for tenant {tenant}")
         
-        # Send another keep-alive to maintain connection
-        yield f": Processing tool results...\n\n"
+        # Send another data event to maintain connection
+        processing_chunk = {
+            "choices": [{
+                "index": 0,
+                "delta": {"content": ""},  # Empty content
+                "finish_reason": None
+            }],
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": request.model or self.config.default_model
+        }
+        yield f"data: {json.dumps(processing_chunk)}\n\n"
         
-        # Make a NON-STREAMING call WITHOUT TOOLS to force text generation
-        # We explicitly don't pass tools to prevent additional tool calls
+        # Make a NON-STREAMING call WITH TOOLS to allow chaining
+        # Get the tools that were used in the original request
+        all_tools = self.tool_service.get_tools_for_tenant(tenant, request.tools)
+        
         try:
-            followup_response = await safe_llm_call(
-                model=request.model or self.config.default_model,
-                messages=self._validate_messages(followup_msgs),
-                stream=False,  # NON-STREAMING to get complete response
-                # NO tools parameter - this forces text generation
-            )
+            followup_kwargs = {
+                "model": request.model or self.config.default_model,
+                "messages": self._validate_messages(followup_msgs),
+                "stream": False,  # NON-STREAMING to get complete response
+            }
+            
+            # Include tools if available to enable chaining
+            if all_tools:
+                filtered_tools = await self.tool_service.filter_tools(followup_msgs, all_tools)
+                if filtered_tools:
+                    followup_kwargs["tools"] = filtered_tools
+                    followup_kwargs["tool_choice"] = "auto"
+                    self._log(f"[{stream_id}] Including {len(filtered_tools)} tools in follow-up for potential chaining")
+            
+            followup_response = await safe_llm_call(**followup_kwargs)
             
             # Check if the response contains tool calls (it shouldn't, but just in case)
             if (followup_response and followup_response.choices and 
@@ -1468,13 +1554,79 @@ class BrainProxy2:
                 
                 # Debug log the message structure
                 self._log(f"Follow-up response message type: {type(message)}")
-                self._log(f"Message attributes: {dir(message)}")
+                #self._log(f"Message attributes: {dir(message)}")
                 
                 # Check for tool calls in the response
                 if hasattr(message, 'tool_calls') and message.tool_calls:
-                    self._log(f"WARNING: Follow-up response unexpectedly contained {len(message.tool_calls)} tool calls")
-                    # Force a text response by making another call without tools
-                    response_content = "Based on the information gathered: " + str(tool_results[-1].get('content', ''))[:200]
+                    # Iterative bounded follow-up loop for multi-tool chains
+                    max_rounds = 10  # Allow up to 10 rounds of tool chaining
+                    accumulated_msgs = followup_msgs[:]
+                    current_message = message
+                    for round_idx in range(max_rounds):
+                        if not getattr(current_message, 'tool_calls', None):
+                            break
+                        tc_list = current_message.tool_calls
+                        self._log(f"Follow-up contains {len(tc_list)} tool calls (round {round_idx+1})")
+                        
+                        # Convert tool calls to the format expected by _execute_tool_calls
+                        # Handle both object and dict formats
+                        more_tool_calls = []
+                        for i, tc in enumerate(tc_list):
+                            if isinstance(tc, dict):
+                                # Already in dict format
+                                more_tool_calls.append(tc)
+                            else:
+                                # Convert from object format
+                                more_tool_calls.append({
+                                    "id": getattr(tc, 'id', None) or f"recursive_{round_idx}_{i}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments
+                                    }
+                                })
+                        
+                        # Log the tools being called
+                        tool_names = [tc['function']['name'] for tc in more_tool_calls]
+                        self._log(f"[{stream_id}] Round {round_idx+1}: Executing tools: {', '.join(tool_names)}")
+                        
+                        # Create mock objects for _execute_tool_calls which expects objects with function attribute
+                        class MockToolCall:
+                            def __init__(self, tool_dict):
+                                self.id = tool_dict.get("id", "")
+                                self.function = type('obj', (object,), {
+                                    'name': tool_dict['function']['name'],
+                                    'arguments': tool_dict['function']['arguments']
+                                })()
+                        
+                        mock_tool_calls = [MockToolCall(tc) for tc in more_tool_calls]
+                        self._log(f"[{stream_id}] Round {round_idx+1}: Executing {len(mock_tool_calls)} recursive tool calls")
+                        more_results = await self._execute_tool_calls(mock_tool_calls, tenant, request.tools)
+                        self._log(f"[{stream_id}] Round {round_idx+1}: Tool execution complete, got {len(more_results)} results")
+                        accumulated_msgs.extend([
+                            {"role": "assistant", "content": None, "tool_calls": more_tool_calls},
+                            *more_results
+                        ])
+                        # Next round LLM call WITH tools to allow further chaining
+                        next_kwargs = {
+                            "model": request.model or self.config.default_model,
+                            "messages": self._validate_messages(accumulated_msgs),
+                            "stream": False
+                        }
+                        
+                        # Include tools for potential further chaining
+                        if all_tools:
+                            filtered_tools_next = await self.tool_service.filter_tools(accumulated_msgs, all_tools)
+                            if filtered_tools_next:
+                                next_kwargs["tools"] = filtered_tools_next
+                                next_kwargs["tool_choice"] = "auto"
+                                self._log(f"[{stream_id}] Round {round_idx+2}: Including {len(filtered_tools_next)} tools for potential chaining")
+                        
+                        next_response = await safe_llm_call(**next_kwargs)
+                        if not next_response or not next_response.choices or not next_response.choices[0].message:
+                            break
+                        current_message = next_response.choices[0].message
+                    response_content = getattr(current_message, 'content', '') or ""
                 else:
                     response_content = message.content or ""
                     self._log(f"Got non-streaming response of length {len(response_content)}")
@@ -1495,68 +1647,73 @@ class BrainProxy2:
             self._log(f"[{stream_id}] Starting to stream response of {len(response_content)} characters")
             self._log(f"[{stream_id}] Full response content: {response_content[:500]}...")  # Log first 500 chars
             
-            # First, send a small status to ensure stream continuity
-            initial_chunk = {
+            # Since we have the complete response, we'll send it in proper SSE format:
+            # 1. Initial role chunk (delta.role = "assistant")
+            # 2. Content chunk(s) with finish_reason: null
+            # 3. Final empty chunk with finish_reason: stop
+            buf.append(response_content)
+            tokens += len(response_content)
+            
+            # Send initial role chunk to start assistant message
+            role_chunk = {
                 "choices": [{
                     "index": 0,
-                    "delta": {"content": ""},  # Empty content to maintain stream
+                    "delta": {"role": "assistant"},
                     "finish_reason": None
                 }],
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": request.model or self.config.default_model
+                "model": request.model or self.config.default_model,
+                "id": chat_id
             }
-            yield f"data: {json.dumps(initial_chunk)}\n\n"
-            await asyncio.sleep(0.001)  # Tiny delay to ensure flushing
+
+            # Send the complete response as one content chunk with finish_reason: null
+            content_chunk = {
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": response_content},
+                    "finish_reason": None  # Must be None for content chunks
+                }],
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model or self.config.default_model,
+                "id": chat_id
+            }
             
-            # Split response into chunks for streaming
-            chunk_size = 20  # Increase chunk size for better performance
-            total_chunks = (len(response_content) + chunk_size - 1) // chunk_size
-            chunks_sent = 0
-            
-            for i in range(0, len(response_content), chunk_size):
-                chunk_text = response_content[i:i + chunk_size]
-                buf.append(chunk_text)
-                tokens += len(chunk_text)
-                chunks_sent += 1
+            try:
+                # Send role chunk
+                role_data = f"data: {json.dumps(role_chunk)}\n\n"
+                self._log(f"[{stream_id}] Sending role chunk (assistant)")
+                yield role_data
+
+                # Send content chunk
+                data = f"data: {json.dumps(content_chunk)}\n\n"
+                self._log(f"[{stream_id}] Sending content chunk with finish_reason=null")
+                yield data
                 
-                # Log every 5th chunk
-                if chunks_sent % 5 == 0 or chunks_sent == 1 or chunks_sent == total_chunks:
-                    self._log(f"Streaming chunk {chunks_sent}/{total_chunks}: '{chunk_text}'")
-                
-                # Create streaming chunk payload
-                chunk_payload = {
+                # Send final chunk with finish_reason=stop and empty delta
+                final_chunk = {
                     "choices": [{
                         "index": 0,
-                        "delta": {"content": chunk_text},
-                        "finish_reason": None
+                        "delta": {},  # Empty delta
+                        "finish_reason": "stop"  # Indicates stream completion
                     }],
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": request.model or self.config.default_model
+                    "model": request.model or self.config.default_model,
+                    "id": chat_id
                 }
+                data = f"data: {json.dumps(final_chunk)}\n\n"
+                self._log(f"[{stream_id}] Sending final chunk with finish_reason=stop")
+                yield data
                 
-                try:
-                    data = f"data: {json.dumps(chunk_payload)}\n\n"
-                    self._log(f"Yielding chunk data: {data[:100]}...") if chunks_sent == 1 else None
-                    yield data
-                    # Don't yield empty strings as they break SSE format
-                except Exception as e:
-                    self._log(f"ERROR yielding chunk {chunks_sent}: {e}")
-                    break
-                
-                # Smaller delay for better streaming
-                if chunks_sent < total_chunks:  # Don't delay on last chunk
-                    try:
-                        await asyncio.sleep(0.005)  # Reduced delay
-                    except Exception as e:
-                        self._log(f"ERROR in sleep: {e}")
-                        break
-            
-            self._log(f"[{stream_id}] Finished streaming {chunks_sent} chunks")
-            
-            # Send final chunk with finish_reason
-            final_chunk = {
+                self._log(f"[{stream_id}] Response sent successfully")
+            except Exception as e:
+                self._log(f"[{stream_id}] ERROR yielding response: {e}")
+        else:
+            self._log("WARNING: response_content is empty or None")
+            # Send empty chunk with finish_reason if no content
+            empty_chunk = {
                 "choices": [{
                     "index": 0,
                     "delta": {},
@@ -1564,24 +1721,23 @@ class BrainProxy2:
                 }],
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": request.model or self.config.default_model
+                "model": request.model or self.config.default_model,
+                "id": chat_id
             }
-            self._log(f"[{stream_id}] Sending final chunk with finish_reason=stop")
-            yield f"data: {json.dumps(final_chunk)}\n\n"
-        else:
-            self._log("WARNING: response_content is empty or None")
+            yield f"data: {json.dumps(empty_chunk)}\n\n"
         
         self._log(f"[{stream_id}] Sending [DONE] marker")
         yield "data: [DONE]\n\n"
         
-        # Store memories
+        # Store memories AFTER generator completes (don't block the stream)
         final_content = "".join(buf)
         self._log(f"[{stream_id}] Final buffered content length: {len(final_content)}")
-        await self.memory_service.store(tenant, messages + [{
+        # Schedule memory storage without awaiting (don't block the generator)
+        asyncio.create_task(self.memory_service.store(tenant, messages + [{
             "role": "assistant",
             "content": final_content,
             "timestamp": datetime.now(timezone.utc).isoformat()
-        }], self.session_service)
+        }], self.session_service))
     
     def _setup_routes(self):
         """Set up FastAPI routes"""
@@ -1671,9 +1827,10 @@ class BrainProxy2:
                 self._handle_streaming(response, msgs, tenant, req),
                 media_type="text/event-stream",
                 headers={
-                    "Cache-Control": "no-cache",
+                    "Cache-Control": "no-cache, no-transform",
                     "X-Accel-Buffering": "no",  # Disable Nginx buffering
-                    "Connection": "keep-alive"
+                    "Connection": "keep-alive",
+                    "Content-Type": "text/event-stream; charset=utf-8"
                 }
             )
 
