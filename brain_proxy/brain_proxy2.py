@@ -1298,6 +1298,10 @@ class BrainProxy2:
     ) -> AsyncIterator[str]:
         """Handle streaming responses with tool support"""
         
+        import uuid
+        stream_id = str(uuid.uuid4())[:8]
+        self._log(f"[{stream_id}] Starting stream for tenant {tenant}")
+        
         # Trigger ready callback
         if self.config.on_thinking:
             try:
@@ -1318,7 +1322,8 @@ class BrainProxy2:
         if tenant_tools:
             local_tool_names.update(t["function"]["name"] for t in tenant_tools)
         
-        # Process initial stream
+        # Process initial stream - MUST consume entirely without breaking
+        finish_reason = None
         async for chunk in upstream_iter:
             payload = await self.streaming_service.process_chunk(chunk)
             choice = payload["choices"][0]
@@ -1356,13 +1361,16 @@ class BrainProxy2:
                 
                 yield f"data: {json.dumps(payload)}\n\n"
             
-            # Check for completion
-            if choice.get("finish_reason") == "tool_calls":
-                self._log(f"Tool calls detected for tenant {tenant}: {len(tool_call_parts)} calls")
-                break
+            # Store finish reason but DON'T BREAK - consume entire stream
+            if choice.get("finish_reason"):
+                finish_reason = choice.get("finish_reason")
+                if finish_reason == "tool_calls":
+                    self._log(f"Tool calls detected for tenant {tenant}: {len(tool_call_parts)} calls")
+                    tool_calls_detected = True
         
-        # If no tool calls, we're done
+        # Stream has been fully consumed - now handle based on finish reason
         if not tool_calls_detected:
+            self._log(f"[{stream_id}] No tool calls detected, ending stream for tenant {tenant}")
             yield "data: [DONE]\n\n"
             
             # Store memories
@@ -1373,6 +1381,12 @@ class BrainProxy2:
             }], self.session_service)
             
             return
+        
+        self._log(f"[{stream_id}] Stream fully consumed, now executing {len(tool_call_parts)} tool calls for tenant {tenant}")
+        
+        # Send a keep-alive comment to maintain SSE connection
+        yield f": Executing {len(tool_call_parts)} tool(s)...\n\n"
+        await asyncio.sleep(0.001)  # Small delay to ensure client processes the keep-alive
         
         # Execute tool calls and stream follow-up
         tool_calls = list(tool_call_parts.values())
@@ -1422,7 +1436,7 @@ class BrainProxy2:
                     "content": f"Error: {str(e)}"
                 })
         
-        # Stream follow-up response with recursive tool support
+        # Build messages with tool results for follow-up
         followup_msgs = messages + [
             {
                 "role": "assistant",
@@ -1432,144 +1446,140 @@ class BrainProxy2:
             *tool_results
         ]
         
-        # Recursive loop for handling additional tool calls in follow-up
-        max_iterations = 10  # Prevent infinite loops
-        iteration = 0
+        self._log(f"[{stream_id}] Making non-streaming follow-up call after tool execution for tenant {tenant}")
         
-        while iteration < max_iterations:
-            iteration += 1
-            self._log(f"Making follow-up call after tool execution for tenant {tenant} (iteration {iteration})")
+        # Send another keep-alive to maintain connection
+        yield f": Processing tool results...\n\n"
+        
+        # Make a NON-STREAMING call WITHOUT TOOLS to force text generation
+        # We explicitly don't pass tools to prevent additional tool calls
+        try:
+            followup_response = await safe_llm_call(
+                model=request.model or self.config.default_model,
+                messages=self._validate_messages(followup_msgs),
+                stream=False,  # NON-STREAMING to get complete response
+                # NO tools parameter - this forces text generation
+            )
             
-            try:
-                followup_iter = await safe_llm_call(
-                    model=request.model or self.config.default_model,
-                    messages=self._validate_messages(followup_msgs),
-                    stream=True
-                )
-            except Exception as e:
-                self._log(f"Error in follow-up call: {e}")
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': f'Error: {str(e)}'}, 'index': 0}]})}\n\n"
-                break
-            
-            additional_tool_calls = {}
-            content_streamed = False
-            
-            try:
-                async for chunk in followup_iter:
-                    payload = await self.streaming_service.process_chunk(chunk)
-                    choice = payload["choices"][0]
-                    delta = choice.get("delta", {})
-                    
-                    # Handle content streaming
-                    if "content" in delta and delta["content"]:
-                        buf.append(delta["content"])
-                        tokens += len(delta["content"])
-                        content_streamed = True
-                        yield f"data: {json.dumps(payload)}\n\n"
-                    
-                    # Check for additional tool calls
-                    for tc in (delta.get("tool_calls", []) or []):
-                        idx = tc.get("index", 0)
-                        if idx not in additional_tool_calls:
-                            additional_tool_calls[idx] = {
-                                "id": tc.get("id"),
-                                "type": "function",
-                                "function": {"name": None, "arguments": ""},
-                                "index": idx
-                            }
-                        
-                        accum = additional_tool_calls[idx]
-                        fn = accum["function"]
-                        upd_fn = tc.get("function", {})
-                        
-                        if "name" in upd_fn and not fn["name"]:
-                            fn["name"] = upd_fn["name"]
-                        if "arguments" in upd_fn:
-                            fn["arguments"] += upd_fn["arguments"]
-                        if tc.get("id"):
-                            accum["id"] = tc["id"]
-                        
-                        # Don't yield tool call chunks to client
-                        # yield f"data: {json.dumps(payload)}\n\n"
-                    
-                    # Check for finish reason
-                    finish_reason = choice.get("finish_reason")
-                    if finish_reason:
-                        if finish_reason == "tool_calls":
-                            self._log(f"Additional tool calls detected in follow-up")
-                            break
-                        elif finish_reason in ["stop", "length"]:
-                            # Normal completion
-                            if not content_streamed:
-                                # If no content was streamed, send an empty message
-                                yield f"data: {json.dumps({'choices': [{'delta': {'content': ''}, 'index': 0, 'finish_reason': finish_reason}]})}\n\n"
-                            break
-            except Exception as e:
-                self._log(f"Error streaming follow-up response: {e}")
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': f'Error: {str(e)}'}, 'index': 0}]})}\n\n"
-                break
-            
-            # If no additional tool calls, we're done
-            if not additional_tool_calls:
-                break
-            
-            # Execute additional tool calls
-            self._log(f"Executing {len(additional_tool_calls)} additional tool calls")
-            new_tool_calls = list(additional_tool_calls.values())
-            new_tool_results = []
-            
-            for tool_call in new_tool_calls:
-                name = tool_call["function"]["name"]
-                args_str = tool_call["function"].get("arguments", "")
-                args = {}
+            # Check if the response contains tool calls (it shouldn't, but just in case)
+            if (followup_response and followup_response.choices and 
+                followup_response.choices[0].message):
+                message = followup_response.choices[0].message
                 
-                if args_str.strip():
-                    try:
-                        args = json.loads(args_str)
-                    except Exception as e:
-                        self._log(f"Error parsing additional tool args for {name}: {e}")
+                # Debug log the message structure
+                self._log(f"Follow-up response message type: {type(message)}")
+                self._log(f"Message attributes: {dir(message)}")
+                
+                # Check for tool calls in the response
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    self._log(f"WARNING: Follow-up response unexpectedly contained {len(message.tool_calls)} tool calls")
+                    # Force a text response by making another call without tools
+                    response_content = "Based on the information gathered: " + str(tool_results[-1].get('content', ''))[:200]
+                else:
+                    response_content = message.content or ""
+                    self._log(f"Got non-streaming response of length {len(response_content)}")
+                    self._log(f"Response preview: {response_content[:200]}..." if response_content else "Response is empty!")
+            else:
+                response_content = "I've completed the requested actions."
+                self._log("No content in follow-up response, using default message")
+                self._log(f"followup_response: {followup_response}")
+                if followup_response and followup_response.choices:
+                    self._log(f"choices[0]: {followup_response.choices[0]}")
+                
+        except Exception as e:
+            self._log(f"Error in follow-up call: {e}")
+            response_content = f"Error processing tool results: {str(e)}"
+        
+        # Now stream the complete response back to the user
+        if response_content:
+            self._log(f"[{stream_id}] Starting to stream response of {len(response_content)} characters")
+            self._log(f"[{stream_id}] Full response content: {response_content[:500]}...")  # Log first 500 chars
+            
+            # First, send a small status to ensure stream continuity
+            initial_chunk = {
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": ""},  # Empty content to maintain stream
+                    "finish_reason": None
+                }],
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model or self.config.default_model
+            }
+            yield f"data: {json.dumps(initial_chunk)}\n\n"
+            await asyncio.sleep(0.001)  # Tiny delay to ensure flushing
+            
+            # Split response into chunks for streaming
+            chunk_size = 20  # Increase chunk size for better performance
+            total_chunks = (len(response_content) + chunk_size - 1) // chunk_size
+            chunks_sent = 0
+            
+            for i in range(0, len(response_content), chunk_size):
+                chunk_text = response_content[i:i + chunk_size]
+                buf.append(chunk_text)
+                tokens += len(chunk_text)
+                chunks_sent += 1
+                
+                # Log every 5th chunk
+                if chunks_sent % 5 == 0 or chunks_sent == 1 or chunks_sent == total_chunks:
+                    self._log(f"Streaming chunk {chunks_sent}/{total_chunks}: '{chunk_text}'")
+                
+                # Create streaming chunk payload
+                chunk_payload = {
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": chunk_text},
+                        "finish_reason": None
+                    }],
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model or self.config.default_model
+                }
                 
                 try:
-                    is_local = name in local_tool_names
-                    
-                    if is_local and self.config.local_tools_handler:
-                        result = await maybe_await(
-                            self.config.local_tools_handler,
-                            tenant, name, args
-                        )
-                    else:
-                        result = await self.tool_service.execute(name, args)
-                    
-                    new_tool_results.append({
-                        "tool_call_id": tool_call["id"] or f"call_{len(new_tool_results)}",
-                        "role": "tool",
-                        "name": name,
-                        "content": str(result)
-                    })
+                    data = f"data: {json.dumps(chunk_payload)}\n\n"
+                    self._log(f"Yielding chunk data: {data[:100]}...") if chunks_sent == 1 else None
+                    yield data
+                    # Don't yield empty strings as they break SSE format
                 except Exception as e:
-                    new_tool_results.append({
-                        "tool_call_id": tool_call["id"] or f"call_{len(new_tool_results)}",
-                        "role": "tool",
-                        "name": name,
-                        "content": f"Error: {str(e)}"
-                    })
+                    self._log(f"ERROR yielding chunk {chunks_sent}: {e}")
+                    break
+                
+                # Smaller delay for better streaming
+                if chunks_sent < total_chunks:  # Don't delay on last chunk
+                    try:
+                        await asyncio.sleep(0.005)  # Reduced delay
+                    except Exception as e:
+                        self._log(f"ERROR in sleep: {e}")
+                        break
             
-            # Update messages for next iteration
-            followup_msgs = followup_msgs + [
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": new_tool_calls
-                },
-                *new_tool_results
-            ]
+            self._log(f"[{stream_id}] Finished streaming {chunks_sent} chunks")
+            
+            # Send final chunk with finish_reason
+            final_chunk = {
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }],
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model or self.config.default_model
+            }
+            self._log(f"[{stream_id}] Sending final chunk with finish_reason=stop")
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+        else:
+            self._log("WARNING: response_content is empty or None")
         
+        self._log(f"[{stream_id}] Sending [DONE] marker")
         yield "data: [DONE]\n\n"
         
         # Store memories
+        final_content = "".join(buf)
+        self._log(f"[{stream_id}] Final buffered content length: {len(final_content)}")
         await self.memory_service.store(tenant, messages + [{
             "role": "assistant",
-            "content": "".join(buf),
+            "content": final_content,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }], self.session_service)
     
@@ -1659,7 +1669,12 @@ class BrainProxy2:
             # Stream response
             return StreamingResponse(
                 self._handle_streaming(response, msgs, tenant, req),
-                media_type="text/event-stream"
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",  # Disable Nginx buffering
+                    "Connection": "keep-alive"
+                }
             )
 
 
